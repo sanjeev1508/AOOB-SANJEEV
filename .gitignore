@@ -15,3 +15,10 @@
 .vscode/
 .idea/
 
+# Raw/intermediate analysis inputs not required to run the web explorer
+messeges.txt
+data/
+array_oob_grouped.json
+
+# Local generated exports
+array_oob_variable_info_combined.json
