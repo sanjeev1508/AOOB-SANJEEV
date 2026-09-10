@@ -1,0 +1,17 @@
+# Installed dependencies and virtual environments
+**/node_modules/
+**/.venv/
+**/venv/
+
+# Build and test output
+**/dist/
+**/build/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.tsbuildinfo
+
+# Local tooling/editor state
+.vscode/
+.idea/
+
