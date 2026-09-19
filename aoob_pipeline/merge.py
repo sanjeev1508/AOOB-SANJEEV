@@ -6,13 +6,21 @@ from aoob_pipeline.schemas import ExplorePack, Fact, MergedPack, PrepPack
 from aoob_pipeline.source_index import SourceIndex
 
 
-def _verify_facts(facts: list[Fact], source: SourceIndex) -> list[Fact]:
+def _fact_key(fact: Fact) -> tuple:
+    return (fact.line, fact.kind, fact.symbol or "", " ".join(fact.quote.split())[:80])
+
+
+def _verify_facts(facts: list[Fact], source: SourceIndex, seen: set[tuple]) -> list[Fact]:
     out: list[Fact] = []
     for fact in facts:
+        key = _fact_key(fact)
+        if key in seen:
+            continue
         ok = source.verify_quote(fact.line, fact.quote)
-        item = fact.model_copy(update={"verified": ok})
-        if ok:
-            out.append(item)
+        if not ok:
+            continue
+        seen.add(key)
+        out.append(fact.model_copy(update={"verified": True}))
     return out
 
 
@@ -22,8 +30,11 @@ def merge_packs(
     var_value: ExplorePack,
     source: SourceIndex,
 ) -> MergedPack:
-    call_facts = _verify_facts(call_path.facts, source)
-    var_facts = _verify_facts(var_value.facts, source)
+    # Dedup across BOTH packs — seeds are emitted by each explorer, and the
+    # duplicated rows used to be repeated again per path class downstream.
+    seen: set[tuple] = set()
+    call_facts = _verify_facts(call_path.facts, source, seen)
+    var_facts = _verify_facts(var_value.facts, source, seen)
 
     # Seed local-guard as a verified var fact when present.
     if prep.local_guard.found and prep.local_guard.line and prep.local_guard.quote:
@@ -36,7 +47,8 @@ def merge_packs(
             note=prep.local_guard.note,
             verified=True,
         )
-        if source.verify_quote(seed.line, seed.quote):
+        if _fact_key(seed) not in seen and source.verify_quote(seed.line, seed.quote):
+            seen.add(_fact_key(seed))
             var_facts.append(seed)
 
     class_ids = [c.class_id for c in prep.path_classes]
@@ -44,13 +56,16 @@ def merge_packs(
         c.class_id: {s.function for s in c.sequence}
         for c in prep.path_classes
     }
+    # Functions whose facts apply to every class: globals, the alarm function
+    # itself, and value-origin callees (they are reached from every path).
+    shared_funcs = {"global", "", prep.enclosing_function or "", *prep.value_origin_callees}
 
     by_class: dict[str, list[Fact]] = {cid: [] for cid in class_ids}
     unattached: list[Fact] = []
     for fact in [*call_facts, *var_facts]:
         attached = False
         for cid, funcs in class_funcs.items():
-            if fact.function in funcs or fact.function in {"global", ""}:
+            if fact.function in funcs or fact.function in shared_funcs:
                 by_class[cid].append(fact)
                 attached = True
         if not attached:

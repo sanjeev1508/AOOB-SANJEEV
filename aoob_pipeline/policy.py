@@ -23,6 +23,8 @@ def fp_is_ironclad(validated: ValidatedReports, merged: MergedPack | None = None
         reasons.append("FP coverage is not full")
     if fp.unaddressed_path_classes:
         reasons.append(f"unaddressed path classes: {fp.unaddressed_path_classes}")
+    if fp.error:
+        reasons.append(f"FP prover error: {fp.error}")
     if fp.index_range == "unknown":
         reasons.append("index_range unknown — cannot prove safe bounds")
     if fp.array_size != "known":

@@ -16,10 +16,19 @@ from aoob_pipeline.schemas import (
 )
 from aoob_pipeline.source_index import SourceIndex, collapse_ws
 
+# Astree frames look like ``call#Fn at file.c:123.4-9`` or ``call#Fn|separate at …``;
+# the ``|separate`` (or other ``|tag``) suffix must not drop the frame.
 _CALL_RE = re.compile(
-    r"call#(?P<fn>[A-Za-z_]\w*)\s+at\s+[^:]+:(?P<line>\d+)",
+    r"call#(?P<fn>[A-Za-z_]\w*)(?:\|[^\s]*)?\s+at\s+[^:]+:(?P<line>\d+)",
     re.IGNORECASE,
 )
+_C_KEYWORDS = frozenset(
+    {
+        "if", "else", "for", "while", "do", "switch", "case", "default", "return",
+        "goto", "break", "continue", "sizeof", "typedef", "struct", "union", "enum",
+    }
+)
+_TYPE_QUALIFIERS = r"(?:(?:const|volatile|static|unsigned|signed|register)\s+)*"
 _LOC_RE = re.compile(r":(?P<line>\d+)(?:\.\d+)?(?:-\d+)?$")
 _GUARD_HINTS = re.compile(
     r"\b(if|while|for|switch)\b|<=|>=|<|>|&&|\|\||\bmin\b|\bmax\b|&\s*0x|%\s*\d+|clamp",
@@ -212,6 +221,273 @@ def _unique_edges(classes: list[PathClass]) -> list[dict[str, Any]]:
     return edges
 
 
+def clean_index_expression(expr: str | None) -> str | None:
+    """Strip whitespace and unbalanced parentheses from an analyzer index slice.
+
+    Astree column ranges sometimes cut ``[(numClass)]`` to ``(numClass``.
+    """
+    if not expr:
+        return expr
+    text = expr.strip()
+    while text.startswith("(") and text.count("(") > text.count(")"):
+        text = text[1:].strip()
+    while text.endswith(")") and text.count(")") > text.count("("):
+        text = text[:-1].strip()
+    if text.startswith("(") and text.endswith(")") and text.count("(") == 1 and text.count(")") == 1:
+        text = text[1:-1].strip()
+    return text or None
+
+
+# Identifier that does not start inside a number literal (``2u`` → no ``u``).
+_IDENT_RE = re.compile(r"(?<![\w.])[A-Za-z_]\w*")
+
+
+def index_tokens(expr: str | None) -> list[str]:
+    toks = _IDENT_RE.findall(expr or "")
+    return [t for t in dict.fromkeys(toks) if t not in _C_KEYWORDS]
+
+
+def _function_header_end(source: SourceIndex, start_line: int, end_line: int) -> int:
+    """Line of the opening ``{`` of the function body (parameters live before it)."""
+    for ln, text in source.get_lines(start_line, min(end_line, start_line + 60)):
+        if "{" in text:
+            return ln
+    return start_line
+
+
+def locate_declaration(
+    source: SourceIndex,
+    *,
+    function: str | None,
+    near_line: int | None,
+    token: str,
+) -> tuple[int, str, str] | None:
+    """Find ``T token`` inside ``function``. Returns (line, text, 'parameter'|'local')."""
+    if not function or not token:
+        return None
+    span = source.function_span(function, near_line=near_line)
+    if span is None:
+        return None
+    header_end = _function_header_end(source, span.start_line, span.end_line)
+    pat = re.compile(
+        rf"(?<![\w.>])(?P<type>{_TYPE_QUALIFIERS}[A-Za-z_]\w*)\s*\**\s+\**\s*\b{re.escape(token)}\b\s*(?:[,;)=\[]|$)"
+    )
+    stop = near_line if near_line and near_line > span.start_line else span.end_line
+    for ln, text in source.get_lines(span.start_line, min(span.end_line, stop)):
+        code = text.split("//", 1)[0]
+        for m in pat.finditer(code):
+            type_word = m.group("type").split()[-1]
+            if type_word in _C_KEYWORDS or type_word == token:
+                continue
+            return ln, text.strip(), "parameter" if ln <= header_end else "local"
+    return None
+
+
+_ASSIGN_RE_TMPL = r"(?<![\w.>])(?:\*\s*)?{tok}\s*(?:\[[^\]]*\])?\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)\s*(?P<rhs>[^;]*);?"
+
+
+def _rhs_identifiers(rhs: str) -> tuple[list[str], list[str]]:
+    """Split an RHS into (identifier tokens, called function names)."""
+    callees = [c for c in re.findall(r"(?<![\w.])([A-Za-z_]\w*)\s*\(", rhs) if c not in _C_KEYWORDS]
+    idents = [t for t in _IDENT_RE.findall(rhs) if t not in _C_KEYWORDS]
+    # struct access ``a->b.c`` → keep the base object only (members are skipped
+    # by the look-behind on ``.``; ``->`` members follow ``>`` and are dropped here)
+    idents = [t for t in idents if t not in callees and not re.search(rf"->\s*{re.escape(t)}\b", rhs)]
+    return list(dict.fromkeys(idents)), list(dict.fromkeys(callees))
+
+
+def _out_param_callees(text: str, tok: str, source: SourceIndex) -> list[str]:
+    """``Fn(..., &tok, ...)`` — the callee fills ``tok`` through a pointer."""
+    out: list[str] = []
+    for m in re.finditer(rf"(?<![\w.])([A-Za-z_]\w*)\s*\([^;{{}}]*&\s*{re.escape(tok)}\b", text):
+        name = m.group(1)
+        if name not in _C_KEYWORDS and name not in out and source.function_span(name) is not None:
+            out.append(name)
+    return out
+
+
+def index_origin(
+    source: SourceIndex,
+    *,
+    function: str | None,
+    alarm_line: int | None,
+    tokens: list[str],
+) -> tuple[str, list[str]]:
+    """Classify how the index gets its value inside the alarm function.
+
+    Returns (origin, value_origin_callees). origin:
+    - ``parameter``: some value feeding the index is a function parameter →
+      callers matter, path coverage matters.
+    - ``global``: fed by a symbol not declared in the function (callers cannot
+      pass it directly, but ordering can matter) → keep conservative.
+    - ``local``: computed only from locals / constants / call results →
+      caller paths cannot change the index.
+    """
+    if not function or not tokens:
+        return "unknown", []
+    span = source.function_span(function, near_line=alarm_line)
+    if span is None:
+        return "unknown", []
+    header_end = _function_header_end(source, span.start_line, span.end_line)
+    header = " ".join(t for _, t in source.get_lines(span.start_line, header_end))
+    header = header.split("{", 1)[0]
+    params = {
+        t for t in re.findall(r"[A-Za-z_]\w*", header.split("(", 1)[1] if "(" in header else "")
+        if t not in _C_KEYWORDS
+    }
+    body_rows = source.get_lines(header_end, span.end_line)
+    body_text = "\n".join(t.split("//", 1)[0] for _, t in body_rows)
+
+    seen: set[str] = set()
+    work = list(tokens)
+    callees: list[str] = []
+    saw_param = False
+    saw_global = False
+    while work:
+        tok = work.pop(0)
+        if tok in seen:
+            continue
+        seen.add(tok)
+        if tok in params:
+            saw_param = True
+            continue
+        decl = locate_declaration(source, function=function, near_line=alarm_line, token=tok)
+        declared_local = decl is not None and decl[2] == "local"
+        if decl is None:
+            # not a param, not declared here → global / static file scope
+            saw_global = True
+        for m in re.finditer(_ASSIGN_RE_TMPL.format(tok=re.escape(tok)), body_text):
+            idents, calls = _rhs_identifiers(m.group("rhs"))
+            for c in calls:
+                if c not in callees and source.function_span(c) is not None:
+                    callees.append(c)
+            for ident in idents:
+                if ident not in seen:
+                    work.append(ident)
+        for c in _out_param_callees(body_text, tok, source):
+            if c not in callees:
+                callees.append(c)
+        if declared_local and decl is not None and "=" in decl[1]:
+            idents, calls = _rhs_identifiers(decl[1].split("=", 1)[1])
+            for c in calls:
+                if c not in callees and source.function_span(c) is not None:
+                    callees.append(c)
+            work.extend(i for i in idents if i not in seen)
+        if len(seen) > 40:
+            break
+
+    if saw_param:
+        return "parameter", callees[:6]
+    if saw_global:
+        return "global", callees[:6]
+    return "local", callees[:6]
+
+
+def caller_value_origin_callees(
+    source: SourceIndex,
+    *,
+    path_classes: list[PathClass],
+    tokens: list[str],
+    limit: int = 6,
+) -> list[str]:
+    """Functions whose return value feeds the index in *caller* functions.
+
+    For each path class walk caller→callee: scan the caller body for
+    ``tok = Callee(...)`` where ``tok`` is an index token (parameter names
+    are usually preserved across this codebase).
+    """
+    out: list[str] = []
+    if not tokens:
+        return out
+    pats = [re.compile(_ASSIGN_RE_TMPL.format(tok=re.escape(t))) for t in tokens]
+    visited: set[str] = set()
+    for cls in path_classes:
+        for step in cls.sequence:
+            fn = step.function
+            if not fn or fn in visited:
+                continue
+            visited.add(fn)
+            body = source.get_func(fn)
+            snippet = str(body.get("snippet") or "")
+            if not snippet:
+                continue
+            for tok, pat in zip(tokens, pats):
+                found = [
+                    c
+                    for m in pat.finditer(snippet)
+                    for c in _rhs_identifiers(m.group("rhs"))[1]
+                ]
+                found.extend(_out_param_callees(snippet, tok, source))
+                for c in found:
+                    if c in out or c in visited:
+                        continue
+                    if source.function_span(c) is not None:
+                        out.append(c)
+                    if len(out) >= limit:
+                        return out
+    return out
+
+
+def _fix_index_symbols(
+    source: SourceIndex,
+    symbols: list[SymbolSkeleton],
+    *,
+    enclosing: str | None,
+    alarm_line: int | None,
+    tokens: list[str],
+    notes: list[str],
+) -> list[SymbolSkeleton]:
+    if not enclosing or not tokens:
+        return symbols
+    out: list[SymbolSkeleton] = []
+    handled: set[str] = set()
+    for sym in symbols:
+        if sym.role == "index" or sym.symbol_name in tokens:
+            hit = locate_declaration(
+                source, function=enclosing, near_line=alarm_line, token=sym.symbol_name
+            )
+            if hit and hit[0] != sym.declaration_line:
+                line, text, scope = hit
+                notes.append(
+                    f"index symbol {sym.symbol_name}: declaration re-pointed to "
+                    f"{enclosing}:{line} ({scope}) from {sym.declaration_line}"
+                )
+                sym = sym.model_copy(
+                    update={
+                        "declaration_line": line,
+                        "declaration_text": text,
+                        "kind": scope,
+                        "function_sequence": [enclosing],
+                        "write_lines": [line],
+                    }
+                )
+            elif hit:
+                sym = sym.model_copy(update={"kind": sym.kind or hit[2]})
+            handled.add(sym.symbol_name)
+        out.append(sym)
+    # Analyzer sometimes omits the index symbol entirely — synthesise it.
+    for tok in tokens:
+        if tok in handled:
+            continue
+        hit = locate_declaration(source, function=enclosing, near_line=alarm_line, token=tok)
+        if not hit:
+            continue
+        line, text, scope = hit
+        out.append(
+            SymbolSkeleton(
+                symbol_name=tok,
+                role="index",
+                kind=scope,
+                declaration_line=line,
+                declaration_text=text,
+                function_sequence=[enclosing],
+                write_lines=[line],
+            )
+        )
+        notes.append(f"index symbol {tok} synthesised from {enclosing}:{line} ({scope})")
+    return out
+
+
 def build_prep(
     *,
     pver_id: str,
@@ -251,8 +527,32 @@ def build_prep(
             array_size = count
             notes_size = f"array_size recovered from initializer count={count}"
 
-    enclosing = alarm.get("enclosing_function")
-    index_expr = (primary.index_expression if primary else None) or alarm.get("variable")
+    enclosing = alarm.get("enclosing_function") or (
+        source.enclosing_function(alarm_line) if alarm_line else None
+    )
+    index_expr = clean_index_expression(
+        (primary.index_expression if primary else None) or alarm.get("variable")
+    )
+    idx_tokens = index_tokens(index_expr)
+    notes: list[str] = []
+
+    # Re-point the index symbol at the declaration that is actually in scope at
+    # the alarm (parameter/local of the enclosing function), not the first
+    # same-named symbol anywhere in the translation unit.
+    symbols = _fix_index_symbols(source, symbols, enclosing=enclosing, alarm_line=alarm_line,
+                                 tokens=idx_tokens, notes=notes)
+
+    origin, origin_callees = index_origin(
+        source, function=enclosing, alarm_line=alarm_line, tokens=idx_tokens
+    )
+    callees = list(origin_callees)
+    if origin == "parameter":
+        for c in caller_value_origin_callees(source, path_classes=path_classes, tokens=idx_tokens):
+            if c not in callees:
+                callees.append(c)
+    if callees:
+        notes.append(f"value-origin callees: {callees}")
+
     local_guard = _local_guard_check(
         source,
         enclosing=enclosing,
@@ -261,11 +561,17 @@ def build_prep(
         array_size=array_size,
     )
 
-    notes: list[str] = []
     if notes_size:
         notes.append(notes_size)
     if coverage_cap == "partial":
-        notes.append(f"path classes capped at {path_class_cap}; coverage marked partial")
+        if origin == "local":
+            coverage_cap = "full"
+            notes.append(
+                f"path classes capped at {path_class_cap}, but index is computed locally "
+                "in the alarm function — caller paths cannot change it; coverage kept full"
+            )
+        else:
+            notes.append(f"path classes capped at {path_class_cap}; coverage marked partial")
     if local_guard.found:
         notes.append("local guard candidate found; path explore may be skipped for FP shortcut")
 
@@ -277,6 +583,8 @@ def build_prep(
         enclosing_function=enclosing,
         alarm_line=alarm_line,
         index_expression=index_expr,
+        index_origin=origin,
+        value_origin_callees=callees,
         array_name=primary.symbol_name if primary else None,
         array_size=array_size,
         raw_paths=raw_paths,

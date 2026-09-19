@@ -180,6 +180,21 @@ class SourceIndex:
             return self.lines[line - 1]
         return None
 
+    def find_quote_line(self, line: int, quote: str, *, radius: int = 2) -> int | None:
+        """Return the exact line (nearest to ``line``) whose text contains ``quote``.
+
+        Single-line match only — used to correct off-by-one line numbers from
+        LLM extracts without accepting multi-line fuzz.
+        """
+        needle = collapse_ws(quote)
+        if not needle or not (1 <= line <= len(self.lines) + radius):
+            return None
+        for offset in sorted(range(-radius, radius + 1), key=abs):
+            ln = line + offset
+            if 1 <= ln <= len(self.lines) and needle in collapse_ws(self.lines[ln - 1]):
+                return ln
+        return None
+
     def verify_quote(self, line: int, quote: str, *, radius: int = 2) -> bool:
         """True if collapsed quote appears on line±radius."""
         needle = collapse_ws(quote)

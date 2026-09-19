@@ -47,6 +47,10 @@ def validate_reports(
 
     def scrub(report: ProveReport, label: str) -> ProveReport:
         kept: list[dict[str, Any]] = []
+        if report.error:
+            dropped.append(f"{label}: prover failed — {report.error}")
+        elif not report.rationale.strip() and not report.findings and not report.missing_evidence:
+            dropped.append(f"{label}: prover returned an empty report (no rationale/findings)")
         for finding in report.findings:
             if _finding_supported(finding, index, source):
                 kept.append(finding)
@@ -60,6 +64,11 @@ def validate_reports(
         addressed = [c for c in report.addressed_path_classes if c in all_ids]
         if report.agent == "FP_PROVE":
             unaddressed = [c for c in all_ids if c not in addressed]
+            # Index computed locally in the alarm function: callers cannot alter
+            # it, so bounding it once addresses every path class.
+            if merged.prep.index_origin == "local" and addressed and kept:
+                unaddressed = []
+                addressed = list(all_ids)
         else:
             unaddressed = list(report.unaddressed_path_classes)
         coverage = report.coverage

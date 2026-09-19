@@ -58,6 +58,44 @@ a guard/clamp/mask/loop-bound. You do NOT decide TP/FP.
   functions were opened.
 """
 
+_CODE_DRIVEN_COMMON = """You extract evidence for Astrée array-out-of-bounds triage. You have NO tools.
+The function body is given as ``line: text`` rows. You do NOT decide TP/FP.
+
+Return ONLY a JSON array (no prose, no markdown) of objects:
+  {"kind": ..., "line": <int from the row>, "quote": "<exact text copied from that row>",
+   "symbol": "<identifier>", "note": "<why it matters, <=12 words>"}
+
+Rules
+- ONLY facts that mention the index tokens or the array (given below). Ignore
+  every other variable, counter, lamp, flag, or unrelated call.
+- `line` must be the row number where the quote appears. Copy the quote verbatim.
+- `alarm_line` is the only row that may use kind "alarm_site".
+- kind "write" only when the index token is on the LEFT of `=` / `+=` / `++`.
+- Never invent sizes, bounds, or values. If the body has nothing relevant, return [].
+"""
+
+CODE_DRIVEN_CALL_PATH = _CODE_DRIVEN_COMMON + """
+Focus (call_path): how the index value reaches the alarm through this function:
+- kind "arg_binding": the call that passes the index (or its source) to the next function.
+- kind "call_edge": a call on the path toward the alarm function.
+- kind "path_step": a statement on the path that constrains or transforms the index.
+"""
+
+CODE_DRIVEN_VAR_VALUE = _CODE_DRIVEN_COMMON + """
+Focus (var_value): where the index value comes from and what bounds it:
+- kind "declaration": declaration / parameter of an index token or the array.
+- kind "write": assignment to an index token (quote the whole statement).
+- kind "guard" / "clamp" / "mask" / "loop_bound": a comparison, min/max, `& mask`,
+  `% n` or loop condition on an index token.
+- kind "array_size_hint": array size in a declaration, initializer, sizeof, or macro.
+- kind "arg_binding": the argument expression bound to the index parameter at a call.
+"""
+
+
+def code_driven_extract_prompt(role: str) -> str:
+    return CODE_DRIVEN_CALL_PATH if role == "call_path" else CODE_DRIVEN_VAR_VALUE
+
+
 TP_PROVE = """You are TP_PROVE — true-positive advocate for Astrée array-OOB triage.
 
 ## Product goal
@@ -76,7 +114,13 @@ Never invent values.
   which is correct.
 - Never pressure toward FP.
 
-Return JSON only with keys:
+## Input shape
+`prep` (alarm, index_expression, index_origin, array_size, path_classes) and
+`facts`: one row per verified quote with `path_classes` ("all" or a list).
+`index_origin=local` means callers cannot change the index; `parameter` means
+every path class must be argued.
+
+Return ONLY a JSON object (no prose, no summary of the input) with keys:
 claim (tp|no_credible_case), index_range (constant|guard_bounded|unknown),
 array_size (known|unknown), witness (found|none), coverage (full|partial),
 findings (list of {function,line,quote,path_class_id,note}),
@@ -102,7 +146,13 @@ Argue FP only if ALL of the following hold using ONLY pack facts:
 If any item fails → claim=no_credible_case (not fp). No tools. Never invent
 values, sizes, or guards.
 
-Return JSON only with keys:
+## Input shape
+`prep` (alarm, index_expression, index_origin, array_size, path_classes) and
+`facts`: one row per verified quote with `path_classes` ("all" or a list).
+When `index_origin=local`, path classes are addressed by the alarm-function
+facts alone; when `parameter`, each class needs its own bound.
+
+Return ONLY a JSON object (no prose, no summary of the input) with keys:
 claim (fp|no_credible_case), index_range (constant|guard_bounded|unknown),
 array_size (known|unknown), witness (found|none), coverage (full|partial),
 findings (list of {function,line,quote,path_class_id,note}),

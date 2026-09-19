@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -81,6 +82,10 @@ def run_pipeline(
                 "local_guard": prep.local_guard.model_dump(),
                 "array": prep.array_name,
                 "array_size": prep.array_size,
+                "index_expression": prep.index_expression,
+                "index_origin": prep.index_origin,
+                "value_origin_callees": prep.value_origin_callees,
+                "notes": prep.notes,
             }
         ),
         functions=list(dict.fromkeys(path_funcs)),
@@ -92,11 +97,15 @@ def run_pipeline(
         activity=f"{len(prep.path_classes)} path classes",
     )
 
+    explore_mode = (os.getenv("AOOB_EXPLORE_MODE") or "code_driven").strip().lower()
     bus.emit(
         "stage",
         stage="explore",
         title="Explorers starting",
-        detail="CALL_PATH_EXPLORE + VAR_VALUE_EXPLORE (LangGraph + tools)",
+        detail=(
+            "CALL_PATH_EXPLORE + VAR_VALUE_EXPLORE "
+            + ("(code-driven: Python opens bodies, LLM extracts)" if explore_mode.startswith("code") else "(LangGraph + tools)")
+        ),
         activity="explore fan-out",
         functions=list(dict.fromkeys(path_funcs)),
     )

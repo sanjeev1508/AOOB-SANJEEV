@@ -17,6 +17,8 @@ from aoob_pipeline.explore_support import (
     call_path_sequence,
     force_open_bodies,
     mine_facts_from_body,
+    normalize_llm_fact,
+    relevance_tokens,
     seed_facts,
     var_value_sequence,
 )
@@ -38,6 +40,8 @@ def _prep_brief(
     prep: PrepPack,
     role: Literal["call_path", "var_value"],
     sequence: list[str],
+    *,
+    code_driven: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "role": role,
@@ -46,19 +50,28 @@ def _prep_brief(
         "enclosing_function": prep.enclosing_function,
         "alarm_line": prep.alarm_line,
         "index_expression": prep.index_expression,
+        "index_origin": prep.index_origin,
+        "value_origin_callees": prep.value_origin_callees,
         "array_name": prep.array_name,
         "array_size": prep.array_size,
         "local_guard": prep.local_guard.model_dump(),
         "coverage_cap": prep.coverage_cap,
         "function_sequence": sequence,
-        "visit_instructions": [
-            "Start at step 1 (already positioned).",
-            "Call get_current() to load the FULL current function.",
-            "Extract quoted facts from that body.",
-            "Call move_func(direction='next') and repeat until remaining=[].",
-            "Call visit_status() anytime to check coverage.",
-            "Then submit_explore_pack with a non-empty facts array.",
-        ],
+        "visit_instructions": (
+            [
+                "Functions are opened for you one at a time (no tools).",
+                "For each body, return ONLY facts about the index/array symbols.",
+            ]
+            if code_driven
+            else [
+                "Start at step 1 (already positioned).",
+                "Call get_current() to load the FULL current function.",
+                "Extract quoted facts from that body.",
+                "Call move_func(direction='next') and repeat until remaining=[].",
+                "Call visit_status() anytime to check coverage.",
+                "Then submit_explore_pack with a non-empty facts array.",
+            ]
+        ),
         "path_classes": [
             {
                 "class_id": c.class_id,
@@ -330,7 +343,7 @@ def _run_explore_code_driven(
     if not sequence:
         sequence = [prep.enclosing_function] if prep.enclosing_function else []
 
-    brief = _prep_brief(prep, role, sequence)
+    brief = _prep_brief(prep, role, sequence, code_driven=True)
     if focus:
         brief["reexplore_focus"] = focus
     if bus:
@@ -344,13 +357,15 @@ def _run_explore_code_driven(
             activity=f"code opens {len(sequence)} funcs; LLM extracts only",
         )
 
-    llm = build_agent_llm(agent)
+    extract_system = prompts.code_driven_extract_prompt(role)
+    relevant = relevance_tokens(prep, sequence)
     all_facts: list[Fact] = list(seeds)
     opened: list[str] = []
     notes = ["explore_mode=code_driven"]
+    dropped_llm = 0
 
     for name in sequence:
-        body = source.get_func(name)
+        body = source.get_func(name, near_line=prep.alarm_line if name == prep.enclosing_function else None)
         opened.append(name)
         if bus:
             bus.emit(
@@ -379,48 +394,33 @@ def _run_explore_code_driven(
                     activity="JSON fact extract (no tools)",
                     functions=[name],
                 )
+            human = (
+                f"function={name}\nrole={role}\n"
+                f"index_expression={prep.index_expression}\n"
+                f"index_tokens={sorted(t for t in relevant if t != prep.array_name and t not in sequence)}\n"
+                f"array={prep.array_name}\narray_size={prep.array_size}\n"
+                f"alarm_line={prep.alarm_line}\n"
+                f"SNIPPET (line: text):\n{snippet[:20000]}"
+            )
             try:
+                llm = build_agent_llm(agent, prompt_chars=len(extract_system) + len(human))
                 msg = llm.invoke(
-                    [
-                        SystemMessage(
-                            content=(
-                                system
-                                + "\n\nFor THIS turn only: return a JSON array of facts "
-                                "{kind,function,line,quote,symbol?,note?}. "
-                                "Quotes MUST appear in the provided snippet. No tools. "
-                                "If nothing useful, return []."
-                            )
-                        ),
-                        HumanMessage(
-                            content=(
-                                f"function={name}\nrole={role}\n"
-                                f"index={prep.index_expression}\narray={prep.array_name}\n"
-                                f"SNIPPET:\n{snippet[:20000]}"
-                            )
-                        ),
-                    ]
+                    [SystemMessage(content=extract_system), HumanMessage(content=human)]
                 )
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
                 for item in _extract_json_list(content):
-                    try:
-                        quote = str(item.get("quote") or "")
-                        line = int(item["line"])
-                        if not quote or not source.verify_quote(line, quote, radius=2):
-                            continue
-                        all_facts.append(
-                            Fact(
-                                kind=str(item.get("kind") or "fact"),
-                                function=str(item.get("function") or name),
-                                line=line,
-                                quote=quote,
-                                symbol=item.get("symbol"),
-                                note=item.get("note") or "llm extract",
-                            )
-                        )
-                    except Exception:  # noqa: BLE001
+                    fact = normalize_llm_fact(
+                        item, function=name, prep=prep, source=source, relevant=relevant
+                    )
+                    if fact is None:
+                        dropped_llm += 1
                         continue
+                    all_facts.append(fact)
             except Exception as exc:  # noqa: BLE001
                 notes.append(f"extract_failed@{name}:{exc}")
+
+    if dropped_llm:
+        notes.append(f"dropped {dropped_llm} irrelevant/unverifiable LLM facts")
 
     # Dedup
     seen: set[tuple] = set()

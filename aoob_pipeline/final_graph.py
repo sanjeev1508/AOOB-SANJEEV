@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from aoob_pipeline import prompts
+from aoob_pipeline.config import pipeline_config
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.llm import build_agent_llm
 from aoob_pipeline.policy import fp_is_ironclad, prefer_label_after_gates
@@ -79,8 +80,8 @@ def _one_final_vote(
     ironclad: bool,
     bus: EventBus | None = None,
     run_idx: int = 1,
+    temperature: float | None = None,
 ) -> dict[str, Any]:
-    llm = build_agent_llm("FINAL_CLASSIFICATION")
     payload = {
         "policy": {
             "wrong_fp_is_worst_error": True,
@@ -93,6 +94,12 @@ def _one_final_vote(
         "dropped_claims": validated.dropped_claims,
         "notes": validated.notes,
     }
+    payload_text = json.dumps(payload, indent=2, ensure_ascii=False)
+    llm = build_agent_llm(
+        "FINAL_CLASSIFICATION",
+        prompt_chars=len(prompts.FINAL_CLASSIFICATION) + len(payload_text),
+        temperature=temperature,
+    )
     if bus:
         bus.emit(
             "agent_input",
@@ -100,7 +107,8 @@ def _one_final_vote(
             stage="final",
             title=f"Input → FINAL (run {run_idx})",
             input_preview=preview_json(payload),
-            activity=f"adjudicating run {run_idx}",
+            activity=f"adjudicating run {run_idx}"
+            + (f" (T={temperature})" if temperature is not None else ""),
         )
 
     def node(_state: FinalState) -> dict:
@@ -115,7 +123,7 @@ def _one_final_vote(
         msg = llm.invoke(
             [
                 SystemMessage(content=prompts.FINAL_CLASSIFICATION),
-                HumanMessage(content=json.dumps(payload, indent=2, ensure_ascii=False)),
+                HumanMessage(content=payload_text),
             ]
         )
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
@@ -200,8 +208,38 @@ def run_final_classification(
             hard_gates=gates,
         )
 
+    # Both provers failed → nothing to adjudicate. Do not burn N LLM calls on
+    # garbage; the answer is uncertain by construction.
+    if validated.tp.error and validated.fp.error:
+        gates = [*gates, "gate: both provers failed — uncertain without final votes"]
+        if bus:
+            bus.emit(
+                "stage",
+                agent="FINAL_CLASSIFICATION",
+                stage="final",
+                title="Provers failed → uncertain",
+                detail=f"TP: {validated.tp.error}; FP: {validated.fp.error}",
+                activity="skipping final votes",
+            )
+        return FinalVerdict(
+            label="uncertain",
+            rationale=(
+                "Both TP_PROVE and FP_PROVE failed to return usable reports "
+                "(model/context problem, not evidence). Human review required."
+            ),
+            tp_summary=validated.tp.rationale,
+            fp_summary=validated.fp.rationale,
+            votes=["uncertain"],
+            run_details=[{"forced": True, "reason": "prover_failure"}],
+            hard_gates=gates,
+        )
+
+    temps = pipeline_config().final_temperatures
     for i in range(max(1, runs)):
-        one = _one_final_vote(validated, ironclad=ironclad, bus=bus, run_idx=i + 1)
+        temp = temps[i % len(temps)] if temps else None
+        one = _one_final_vote(
+            validated, ironclad=ironclad, bus=bus, run_idx=i + 1, temperature=temp
+        )
         label, note = prefer_label_after_gates(one["label"], validated, ironclad=ironclad)
         if force == "uncertain" and label == "FP":
             label, note = "uncertain", "forced uncertain (FP not ironclad)"

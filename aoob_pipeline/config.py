@@ -41,6 +41,8 @@ class PipelineConfig:
     max_reexplore: int = 1
     ollama_fallback: bool = True
     tp_policy: str = "type_legal"  # type_legal | operating_range
+    prover_brief_max_chars: int = 60000
+    final_temperatures: tuple[float, ...] = (0.0, 0.3, 0.6)
 
 
 def project_root_from(here: Path | None = None) -> Path:
@@ -70,7 +72,7 @@ def resolve_agent(name: str, root: Path | None = None) -> AgentLLMConfig:
     backend = _backend(os.getenv(f"{name}_AGENT"))
     override = (os.getenv(f"{name}_MODEL") or "").strip()
     timeout = float(os.getenv("OLLAMA_TIMEOUT") or os.getenv("BOSCH_TIMEOUT") or 180)
-    num_ctx = int(os.getenv("OLLAMA_NUM_CTX") or 16384)
+    num_ctx = int(os.getenv("OLLAMA_NUM_CTX") or 8192)
 
     if backend == "bosch":
         model = override or (os.getenv("BOSCH_MODEL") or "GPT-5-nano")
@@ -121,4 +123,19 @@ def pipeline_config(root: Path | None = None) -> PipelineConfig:
         max_reexplore=int(os.getenv("AOOB_MAX_REEXPLORE") or 1),
         ollama_fallback=(os.getenv("AOOB_OLLAMA_RUNTIME_FALLBACK") or "1").strip() not in {"0", "false", "no"},
         tp_policy=(os.getenv("AOOB_TP_POLICY") or "type_legal").strip().lower(),
+        prover_brief_max_chars=int(os.getenv("AOOB_PROVER_BRIEF_MAX_CHARS") or 60000),
+        final_temperatures=_parse_temps(os.getenv("AOOB_FINAL_TEMPERATURES")),
     )
+
+
+def _parse_temps(raw: str | None) -> tuple[float, ...]:
+    out: list[float] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(max(0.0, min(1.5, float(part))))
+        except ValueError:
+            continue
+    return tuple(out) or (0.0, 0.3, 0.6)

@@ -59,6 +59,10 @@ class PrepPack(BaseModel):
     enclosing_function: str | None = None
     alarm_line: int | None = None
     index_expression: str | None = None
+    # parameter | local | global | unknown — whether callers can influence the index
+    index_origin: str = "unknown"
+    # functions called on the RHS of assignments to index tokens (value origins)
+    value_origin_callees: list[str] = Field(default_factory=list)
     array_name: str | None = None
     array_size: int | None = None
     raw_paths: list[RawPath] = Field(default_factory=list)
