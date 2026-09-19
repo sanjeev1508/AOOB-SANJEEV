@@ -195,7 +195,9 @@ def run_pipeline(
         detail=f"multi-run ×{cfg.final_runs}",
         activity="adjudicating",
     )
-    verdict = run_final_classification(validated, runs=cfg.final_runs, bus=bus)
+    verdict = run_final_classification(
+        validated, runs=cfg.final_runs, bus=bus, merged=merged
+    )
     write_json(out / "06_final_vote.json", verdict)
 
     if verdict.reexplore_requested and cfg.max_reexplore >= 1 and verdict.reexplore_focus:
@@ -240,7 +242,9 @@ def run_pipeline(
         write_json(out / "09_fp_prove.json", fp)
         validated = validate_reports(merged, tp, fp, source)
         write_json(out / "10_validated.json", validated)
-        verdict = run_final_classification(validated, runs=cfg.final_runs, bus=bus)
+        verdict = run_final_classification(
+        validated, runs=cfg.final_runs, bus=bus, merged=merged
+    )
         verdict = verdict.model_copy(update={"reexplore_requested": False})
         write_json(out / "11_final.json", verdict)
 

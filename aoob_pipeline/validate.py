@@ -1,9 +1,10 @@
-"""Evidence validator: drop uncited / unverifiable prover claims."""
+"""Evidence validator: drop uncited claims; downgrade weak FP/TP."""
 
 from __future__ import annotations
 
 from typing import Any
 
+from aoob_pipeline.policy import fp_is_ironclad
 from aoob_pipeline.schemas import MergedPack, ProveReport, ValidatedReports
 from aoob_pipeline.source_index import SourceIndex, collapse_ws
 
@@ -51,12 +52,10 @@ def validate_reports(
                 kept.append(finding)
             else:
                 dropped.append(f"{label}: dropped unsupported finding {finding!r}")
-        # If witness claimed but no kept finding supports it, clear witness.
         witness = report.witness
         if report.claim == "tp" and witness == "found" and not kept:
             witness = "none"
             dropped.append(f"{label}: cleared witness — no validated findings")
-        # FP must list every path class; enforce unaddressed from prep.
         all_ids = [c.class_id for c in merged.prep.path_classes]
         addressed = [c for c in report.addressed_path_classes if c in all_ids]
         if report.agent == "FP_PROVE":
@@ -83,9 +82,42 @@ def validate_reports(
             }
         )
 
-    return ValidatedReports(
+    scrubbed = ValidatedReports(
         tp=scrub(tp, "TP"),
         fp=scrub(fp, "FP"),
-        dropped_claims=dropped,
+        dropped_claims=list(dropped),
         notes=["validator checked quotes against merged facts and source"],
     )
+
+    # Downgrade FP claims that are not ironclad — never let a soft FP reach the judge as fp.
+    ok, reasons = fp_is_ironclad(scrubbed, merged)
+    if scrubbed.fp.claim == "fp" and not ok:
+        scrubbed = scrubbed.model_copy(
+            update={
+                "fp": scrubbed.fp.model_copy(
+                    update={
+                        "claim": "no_credible_case",
+                        "coverage": "partial" if scrubbed.fp.coverage != "full" else scrubbed.fp.coverage,
+                        "missing_evidence": list(
+                            dict.fromkeys([*scrubbed.fp.missing_evidence, *reasons])
+                        ),
+                        "rationale": (
+                            scrubbed.fp.rationale
+                            + " | Downgraded from fp: evidence not ironclad ("
+                            + "; ".join(reasons)
+                            + ")."
+                        ),
+                    }
+                ),
+                "dropped_claims": [
+                    *scrubbed.dropped_claims,
+                    "FP: claim downgraded fp→no_credible_case (not ironclad)",
+                ],
+                "notes": [
+                    *scrubbed.notes,
+                    "FP precision policy: only ironclad full-trace FP may stand",
+                ],
+            }
+        )
+
+    return scrubbed

@@ -1,4 +1,4 @@
-"""LangGraph final classification (strict gates + multi-run majority)."""
+"""LangGraph final classification (strict FP-precision gates + multi-run)."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from langgraph.graph import END, START, StateGraph
 from aoob_pipeline import prompts
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.llm import build_agent_llm
-from aoob_pipeline.schemas import FinalVerdict, ValidatedReports
+from aoob_pipeline.policy import fp_is_ironclad, prefer_label_after_gates
+from aoob_pipeline.schemas import FinalVerdict, MergedPack, ValidatedReports
 
 
 class FinalState(TypedDict):
@@ -39,33 +40,54 @@ def _extract_json(text: str) -> dict[str, Any]:
     return data
 
 
-def apply_hard_gates(validated: ValidatedReports) -> tuple[str | None, list[str]]:
-    """Return forced label (or None) and gate notes."""
+def apply_hard_gates(
+    validated: ValidatedReports,
+    merged: MergedPack | None = None,
+) -> tuple[str | None, list[str], bool]:
+    """Return (forced_label, gate_notes, fp_ironclad).
+
+    Forced labels:
+    - TP when a validated witness exists
+    - uncertain when FP was claimed but is not ironclad
+    - None otherwise (LLM may vote, still clamped later)
+    """
     notes: list[str] = []
     tp, fp = validated.tp, validated.fp
+    ironclad, why = fp_is_ironclad(validated, merged)
+    if not ironclad:
+        notes.extend(f"fp-block: {r}" for r in why)
+    else:
+        notes.append("gate: FP checklist ironclad")
+
+    force: str | None = None
     if tp.claim == "tp" and tp.witness == "found":
         notes.append("gate: validated TP witness present")
-        # Still allow LLM, but FP is forbidden.
-    if fp.coverage != "full" or fp.unaddressed_path_classes:
-        notes.append("gate: FP coverage incomplete — FP forbidden")
-    if tp.claim == "tp" and tp.witness == "found" and fp.claim == "fp":
-        notes.append("gate: TP witness vs FP claim conflict → prefer uncertain unless FP invalid")
-    # Force uncertain when FP would be wrong under gates.
-    force = None
-    if tp.claim == "tp" and tp.witness == "found" and not (
-        fp.coverage == "full" and not fp.unaddressed_path_classes
-    ):
         force = "TP"
-        notes.append("gate: force TP (validated witness, FP incomplete)")
-    elif fp.claim == "fp" and (fp.coverage != "full" or fp.unaddressed_path_classes):
+        notes.append("gate: force TP (never miss a witnessed bug)")
+    elif fp.claim == "fp" and not ironclad:
         force = "uncertain"
-        notes.append("gate: force uncertain (FP claim without full coverage)")
-    return force, notes
+        notes.append("gate: force uncertain (FP not ironclad — protect real TPs)")
+    elif fp.claim == "fp" and ironclad and not (tp.claim == "tp" and tp.witness == "found"):
+        # Do not auto-force FP — still require unanimous final votes.
+        notes.append("gate: FP eligible (ironclad); requires unanimous final votes")
+    return force, notes, ironclad
 
 
-def _one_final_vote(validated: ValidatedReports, bus: EventBus | None = None, run_idx: int = 1) -> dict[str, Any]:
+def _one_final_vote(
+    validated: ValidatedReports,
+    *,
+    ironclad: bool,
+    bus: EventBus | None = None,
+    run_idx: int = 1,
+) -> dict[str, Any]:
     llm = build_agent_llm("FINAL_CLASSIFICATION")
     payload = {
+        "policy": {
+            "wrong_fp_is_worst_error": True,
+            "fp_requires_ironclad_full_trace": True,
+            "default_when_unsure": "uncertain",
+            "fp_currently_ironclad": ironclad,
+        },
         "tp": validated.tp.model_dump(),
         "fp": validated.fp.model_dump(),
         "dropped_claims": validated.dropped_claims,
@@ -88,7 +110,7 @@ def _one_final_vote(validated: ValidatedReports, bus: EventBus | None = None, ru
                 agent="FINAL_CLASSIFICATION",
                 stage="final",
                 title=f"FINAL reasoning (run {run_idx})",
-                activity="strict classification rules",
+                activity="FP-precision policy (never miss TP)",
             )
         msg = llm.invoke(
             [
@@ -109,11 +131,9 @@ def _one_final_vote(validated: ValidatedReports, bus: EventBus | None = None, ru
         label = str(data.get("label") or "uncertain").upper()
         if label not in {"TP", "FP", "UNCERTAIN"}:
             label = "UNCERTAIN"
-        if label == "UNCERTAIN":
-            label = "uncertain"
         return {
             "result": {
-                "label": label if label != "UNCERTAIN" else "uncertain",
+                "label": "uncertain" if label == "UNCERTAIN" else label,
                 "rationale": str(data.get("rationale") or ""),
                 "reexplore_requested": bool(data.get("reexplore_requested")),
                 "reexplore_focus": data.get("reexplore_focus"),
@@ -152,8 +172,9 @@ def run_final_classification(
     *,
     runs: int = 3,
     bus: EventBus | None = None,
+    merged: MergedPack | None = None,
 ) -> FinalVerdict:
-    force, gates = apply_hard_gates(validated)
+    force, gates, ironclad = apply_hard_gates(validated, merged)
     votes: list[str] = []
     details: list[dict[str, Any]] = []
     reexplore = False
@@ -167,58 +188,70 @@ def run_final_classification(
                 stage="final",
                 title="Hard gate → TP",
                 detail="; ".join(gates),
-                activity="forced TP",
+                activity="forced TP (validated witness)",
             )
         return FinalVerdict(
             label="TP",
-            rationale="Hard gate: validated TP witness with incomplete/conflicting FP.",
+            rationale="Hard gate: validated TP witness — never auto-close as FP.",
             tp_summary=validated.tp.rationale,
             fp_summary=validated.fp.rationale,
             votes=["TP"],
-            run_details=[{"forced": True}],
+            run_details=[{"forced": True, "reason": "tp_witness"}],
             hard_gates=gates,
         )
 
     for i in range(max(1, runs)):
-        one = _one_final_vote(validated, bus=bus, run_idx=i + 1)
-        label = one["label"]
+        one = _one_final_vote(validated, ironclad=ironclad, bus=bus, run_idx=i + 1)
+        label, note = prefer_label_after_gates(one["label"], validated, ironclad=ironclad)
         if force == "uncertain" and label == "FP":
-            label = "uncertain"
-            one = {**one, "label": "uncertain", "clamped": "FP→uncertain by hard gate"}
-        if validated.tp.claim == "tp" and validated.tp.witness == "found" and label == "FP":
-            label = "uncertain"
-            one = {**one, "label": "uncertain", "clamped": "FP blocked: TP witness exists"}
-        if (
-            label == "FP"
-            and (
-                validated.fp.coverage != "full"
-                or validated.fp.unaddressed_path_classes
-                or validated.tp.claim == "tp"
-            )
-        ):
-            label = "uncertain"
-            one = {**one, "label": "uncertain", "clamped": "FP blocked by coverage/witness gates"}
+            label, note = "uncertain", "forced uncertain (FP not ironclad)"
+        if note:
+            one = {**one, "label": label, "clamped": note}
+        else:
+            one = {**one, "label": label}
         votes.append(label)
         details.append(one)
-        if one.get("reexplore_requested"):
+        # Re-explore only to gather missing bound/size evidence — never to hunt FP.
+        if one.get("reexplore_requested") and label == "uncertain":
             reexplore = True
             focus = one.get("reexplore_focus") or focus
 
     counts = Counter(votes)
-    if len(counts) > 1 and counts.most_common(1)[0][1] < len(votes):
+    # Unanimous FP required when ironclad; any dissent → uncertain.
+    if "FP" in counts:
+        if counts["FP"] < len(votes) or not ironclad:
+            winner = "uncertain"
+            gates = [*gates, "majority: FP requires unanimous ironclad votes"]
+        else:
+            winner = "FP"
+    elif len(counts) > 1 and counts.most_common(1)[0][1] < len(votes):
         top_n = counts.most_common()
         if len(top_n) > 1 and top_n[0][1] == top_n[1][1]:
             winner = "uncertain"
         elif top_n[0][1] < len(votes):
-            winner = "uncertain"
+            # Prefer TP over uncertain only if TP won a plurality and witness exists
+            if top_n[0][0] == "TP" and validated.tp.witness == "found":
+                winner = "TP"
+            else:
+                winner = "uncertain"
         else:
             winner = top_n[0][0]
     else:
         winner = counts.most_common(1)[0][0]
 
+    # Final safety clamp
+    winner, final_note = prefer_label_after_gates(winner, validated, ironclad=ironclad)
+    if final_note:
+        gates = [*gates, final_note]
+
     rationale = details[-1].get("rationale") if details else ""
     if winner == "uncertain" and len(set(votes)) > 1:
-        rationale = f"Majority disagreement among votes {votes}. " + str(rationale)
+        rationale = f"Majority/policy disagreement among votes {votes}. " + str(rationale)
+    if winner == "FP":
+        rationale = (
+            "Ironclad FP: full coverage, known size, bounded index on all path classes, "
+            "unanimous votes, no TP witness. " + str(rationale)
+        )
 
     verdict = FinalVerdict(
         label=winner,  # type: ignore[arg-type]

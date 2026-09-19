@@ -124,11 +124,20 @@ void alarm_fn(void) {
         claim="fp",
         witness="none",
         coverage="full",
+        index_range="guard_bounded",
+        array_size="known",
         addressed_path_classes=["C1"],
+        missing_evidence=[],
         findings=[
             {"function": "helper", "line": 5, "quote": "idx = x & 3;", "path_class_id": "C1"},
+            {"function": "alarm_fn", "line": 9, "quote": "if (idx < 4) {", "path_class_id": "C1"},
         ],
     )
     validated = validate_reports(merged, tp, fp, source)
     assert validated.fp.claim == "fp"
     assert not validated.fp.unaddressed_path_classes
+
+    # Weak FP (unknown size) must be downgraded — never-miss-TP policy
+    weak = fp.model_copy(update={"array_size": "unknown", "index_range": "unknown"})
+    weak_v = validate_reports(merged, tp, weak, source)
+    assert weak_v.fp.claim == "no_credible_case"
