@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated, Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -15,6 +16,7 @@ from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.explore_support import (
     call_path_sequence,
     force_open_bodies,
+    mine_facts_from_body,
     seed_facts,
     var_value_sequence,
 )
@@ -285,6 +287,169 @@ def _fallback_facts_from_bodies(
     return facts
 
 
+def _extract_json_list(text: str) -> list[dict[str, Any]]:
+    raw = (text or "").strip()
+    if "</think>" in raw:
+        raw = raw.split("</think>")[-1].strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    if fence:
+        raw = fence.group(1).strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start, end = raw.find("["), raw.rfind("]")
+        if start < 0 or end <= start:
+            start, end = raw.find("{"), raw.rfind("}")
+            if start < 0 or end <= start:
+                return []
+            data = json.loads(raw[start : end + 1])
+        else:
+            data = json.loads(raw[start : end + 1])
+    if isinstance(data, dict) and "facts" in data:
+        data = data["facts"]
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+    return [x for x in data if isinstance(x, dict)]
+
+
+def _run_explore_code_driven(
+    *,
+    agent: str,
+    system: str,
+    role: Literal["call_path", "var_value"],
+    prep: PrepPack,
+    source: SourceIndex,
+    sequence: list[str],
+    focus: str | None,
+    bus: EventBus | None,
+) -> ExplorePack:
+    """Python opens every function; LLM only extracts facts (7B-friendly)."""
+    seeds = seed_facts(prep, source)
+    if not sequence:
+        sequence = [prep.enclosing_function] if prep.enclosing_function else []
+
+    brief = _prep_brief(prep, role, sequence)
+    if focus:
+        brief["reexplore_focus"] = focus
+    if bus:
+        bus.emit(
+            "agent_input",
+            agent=agent,
+            stage="explore",
+            title=f"Input → {agent} (code-driven)",
+            input_preview=preview_json(brief),
+            functions=sequence,
+            activity=f"code opens {len(sequence)} funcs; LLM extracts only",
+        )
+
+    llm = build_agent_llm(agent)
+    all_facts: list[Fact] = list(seeds)
+    opened: list[str] = []
+    notes = ["explore_mode=code_driven"]
+
+    for name in sequence:
+        body = source.get_func(name)
+        opened.append(name)
+        if bus:
+            bus.emit(
+                "tool_result",
+                agent=agent,
+                stage="explore",
+                title=f"{agent} ← get_func({name})",
+                tool="get_func",
+                output_preview=str(body.get("snippet") or body.get("error") or "")[:1200],
+                functions=[name],
+                activity=f"opened {name}",
+            )
+        mined = mine_facts_from_body(agent=agent, function=name, body=body, prep=prep)
+        for f in mined:
+            all_facts.append(f)
+
+        # Small LLM pass: extract additional quoted facts from this body only
+        snippet = str(body.get("snippet") or "")
+        if snippet and not body.get("error"):
+            if bus:
+                bus.emit(
+                    "agent_thinking",
+                    agent=agent,
+                    stage="explore",
+                    title=f"{agent} extract @ {name}",
+                    activity="JSON fact extract (no tools)",
+                    functions=[name],
+                )
+            try:
+                msg = llm.invoke(
+                    [
+                        SystemMessage(
+                            content=(
+                                system
+                                + "\n\nFor THIS turn only: return a JSON array of facts "
+                                "{kind,function,line,quote,symbol?,note?}. "
+                                "Quotes MUST appear in the provided snippet. No tools. "
+                                "If nothing useful, return []."
+                            )
+                        ),
+                        HumanMessage(
+                            content=(
+                                f"function={name}\nrole={role}\n"
+                                f"index={prep.index_expression}\narray={prep.array_name}\n"
+                                f"SNIPPET:\n{snippet[:20000]}"
+                            )
+                        ),
+                    ]
+                )
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                for item in _extract_json_list(content):
+                    try:
+                        quote = str(item.get("quote") or "")
+                        line = int(item["line"])
+                        if not quote or not source.verify_quote(line, quote, radius=2):
+                            continue
+                        all_facts.append(
+                            Fact(
+                                kind=str(item.get("kind") or "fact"),
+                                function=str(item.get("function") or name),
+                                line=line,
+                                quote=quote,
+                                symbol=item.get("symbol"),
+                                note=item.get("note") or "llm extract",
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        continue
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"extract_failed@{name}:{exc}")
+
+    # Dedup
+    seen: set[tuple] = set()
+    deduped: list[Fact] = []
+    for f in all_facts:
+        key = (f.function, f.line, f.kind, f.quote[:100])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+
+    pack = ExplorePack(
+        agent=agent,
+        facts=deduped,
+        notes=[*notes, f"opened={opened}", f"seeded {len(seeds)} deterministic facts"],
+    )
+    if bus:
+        bus.emit(
+            "agent_output",
+            agent=agent,
+            stage="explore",
+            title=f"Output ← {agent}",
+            output_preview=preview_json(pack.model_dump()),
+            functions=opened,
+            activity=f"produced {len(deduped)} facts (code-driven)",
+        )
+    return pack
+
+
 def _run_explore(
     *,
     agent: str,
@@ -297,6 +462,22 @@ def _run_explore(
     focus: str | None,
     bus: EventBus | None,
 ) -> ExplorePack:
+    import os
+
+    mode = (os.getenv("AOOB_EXPLORE_MODE") or "code_driven").strip().lower()
+    if mode in {"code", "code_driven", "deterministic"}:
+        return _run_explore_code_driven(
+            agent=agent,
+            system=system,
+            role=role,
+            prep=prep,
+            source=source,
+            sequence=sequence,
+            focus=focus,
+            bus=bus,
+        )
+
+    # Legacy tool-agent path (needs strong tool-calling models)
     seeds = seed_facts(prep, source)
     if not sequence:
         sequence = [prep.enclosing_function] if prep.enclosing_function else []
@@ -313,7 +494,7 @@ def _run_explore(
             title=f"Input → {agent}",
             input_preview=preview_json(brief),
             functions=sequence,
-            activity=f"sequence n={len(sequence)}; must visit all",
+            activity=f"sequence n={len(sequence)}; tool-agent mode",
             edges=[
                 {"s": str(e.get("caller")), "t": str(e.get("callee"))}
                 for e in prep.edges[:30]
@@ -324,7 +505,6 @@ def _run_explore(
     cursor = ExploreCursor(sequence=list(sequence))
     tools, sink = make_explore_tools(source, cursor)
     llm = build_agent_llm(agent)
-    # Enough rounds to get+move per function + submit
     rounds = max(max_rounds, max(8, len(sequence) * 3 + 4))
     graph = _build_explore_graph(
         llm, tools, sink, cursor, max_rounds=rounds, agent=agent, bus=bus
@@ -358,51 +538,27 @@ def _run_explore(
                 detail=str(exc),
                 activity="error",
             )
-        # Fall through to forced open
-        sink.setdefault("notes", [])
 
-    # Coverage guarantee: force-open any remaining bodies and ask one final submit.
-    if sink.get("pack") is None and cursor.remaining():
+    if sink.get("pack") is None:
         if bus:
             bus.emit(
                 "stage",
                 agent=agent,
                 stage="explore",
-                title=f"{agent} forced open remaining",
-                detail=str(cursor.remaining()),
-                activity="deterministic coverage fill",
-                functions=cursor.remaining(),
+                title=f"{agent} code-driven fallback",
+                activity="tool-agent failed; switching to code-driven",
+                functions=sequence,
             )
-        bodies = force_open_bodies(source, cursor.remaining())
-        for name in list(cursor.remaining()):
-            cursor.mark_opened(name)
-        # One last LLM chance with bodies in context
-        try:
-            bound = llm.bind_tools(tools)
-            final = bound.invoke(
-                [
-                    SystemMessage(content=system),
-                    HumanMessage(
-                        content=(
-                            "Coverage fill: below are FULL bodies for functions you did not open. "
-                            "Call submit_explore_pack NOW with quoted facts from these bodies.\n\n"
-                            + json.dumps(bodies, ensure_ascii=False)[:50000]
-                        )
-                    ),
-                ]
-            )
-            if isinstance(final, AIMessage) and final.tool_calls:
-                ToolNode(tools).invoke({"messages": [final]})
-        except Exception:  # noqa: BLE001
-            pass
-        if sink.get("pack") is None:
-            # Last resort: fallback facts from forced bodies + seeds
-            all_bodies = force_open_bodies(source, sequence)
-            fallback = _fallback_facts_from_bodies(agent, sequence, all_bodies, prep)
-            sink["pack"] = {
-                "facts": [f.model_dump() for f in fallback],
-                "notes": ["fallback facts after forced open; LLM did not submit"],
-            }
+        return _run_explore_code_driven(
+            agent=agent,
+            system=system,
+            role=role,
+            prep=prep,
+            source=source,
+            sequence=sequence,
+            focus=focus,
+            bus=bus,
+        )
 
     pack = _pack_from_sink(agent, sink, seeds)
     if bus:
@@ -426,7 +582,6 @@ def run_call_path_explore(
     focus: str | None = None,
     bus: EventBus | None = None,
 ) -> ExplorePack:
-    # Local-guard skip still visits enclosing function once for call-path context.
     sequence = call_path_sequence(prep)
     if prep.skip_path_explore and not focus:
         seeds = seed_facts(prep, source)
@@ -472,7 +627,7 @@ def run_var_value_explore(
         role="var_value",
         prep=prep,
         source=source,
-        sequence=var_value_sequence(prep),
+        sequence=var_value_sequence(prep, source),
         max_rounds=max_rounds,
         focus=focus,
         bus=bus,

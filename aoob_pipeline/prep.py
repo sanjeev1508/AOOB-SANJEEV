@@ -240,10 +240,16 @@ def build_prep(
     symbols = _collect_symbols(alarm)
     primary = symbols[0] if symbols else None
     array_size = None
+    notes_size: str | None = None
     if primary and primary.resolved_sizes:
         array_size = primary.resolved_sizes[0]
-    elif primary and primary.size_known is False:
-        array_size = None
+    elif primary and primary.declaration_line:
+        from aoob_pipeline.explore_support import _count_initializer_elements
+
+        count, _, _ = _count_initializer_elements(source, int(primary.declaration_line))
+        if count:
+            array_size = count
+            notes_size = f"array_size recovered from initializer count={count}"
 
     enclosing = alarm.get("enclosing_function")
     index_expr = (primary.index_expression if primary else None) or alarm.get("variable")
@@ -256,6 +262,8 @@ def build_prep(
     )
 
     notes: list[str] = []
+    if notes_size:
+        notes.append(notes_size)
     if coverage_cap == "partial":
         notes.append(f"path classes capped at {path_class_cap}; coverage marked partial")
     if local_guard.found:

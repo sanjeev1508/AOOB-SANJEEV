@@ -92,7 +92,7 @@ def test_seed_and_sequences(tmp_path: Path) -> None:
     }
     prep = build_prep(pver_id="t", order="1", alarm=alarm, source=source)
     assert call_path_sequence(prep) == ["alarm_fn"]
-    assert "alarm_fn" in var_value_sequence(prep)
+    assert "alarm_fn" in var_value_sequence(prep, source)
     seeds = seed_facts(prep, source)
     assert any(f.kind == "declaration" for f in seeds)
     assert any(f.kind == "alarm_site" for f in seeds)
