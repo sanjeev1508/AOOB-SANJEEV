@@ -1,0 +1,29 @@
+# Secrets / local env
+.env
+.env.*
+
+# PVER analysis datasets (large; keep local only)
+PVERs/
+
+# Installed dependencies and virtual environments
+**/node_modules/
+**/.venv/
+**/venv/
+
+# Build and test output
+**/dist/
+**/build/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
+*.tsbuildinfo
+
+# Local tooling/editor state
+.vscode/
+.idea/
+
+# Raw/intermediate analysis inputs
+messeges.txt
+data/
+array_oob_grouped.json
+array_oob_variable_info_combined.json
