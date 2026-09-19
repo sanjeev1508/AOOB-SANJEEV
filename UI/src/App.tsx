@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
@@ -10,7 +10,18 @@ import ReactFlow, {
 } from "reactflow";
 import dagre from "dagre";
 import "reactflow/dist/style.css";
-import { AlarmDetail, CfgNeighborhood, GraphHighlight, GraphPayload, PathRecord, PverInfo, PverListResponse, VariableInfo } from "./types";
+import {
+  AgentFocus,
+  AlarmDetail,
+  CfgNeighborhood,
+  GraphHighlight,
+  GraphPayload,
+  PathRecord,
+  PipelineEvent,
+  PverInfo,
+  PverListResponse,
+  VariableInfo,
+} from "./types";
 import FullGraph from "./FullGraph";
 import { AccessFilter, executionRole, matchesAccessFilter, orderFunctionsByExecution } from "./cfgOrder";
 import { PathFilter, filterSequencesByVariable, functionKey, pathFunctions, uniqueSequences } from "./paths";
@@ -427,14 +438,126 @@ function VariableExplorer({
   );
 }
 
-function AgentChat({ pver, mode, alarm }: { pver: string; mode: "alarm" | "pver"; alarm?: string }) {
-  const [messages, setMessages] = useState<Array<{ role: "system" | "user" | "assistant"; text: string }>>([
+function formatEvent(event: PipelineEvent): string {
+  const bits = [
+    event.title || event.kind,
+    event.agent ? `[${event.agent}]` : "",
+    event.activity ? `· ${event.activity}` : "",
+  ].filter(Boolean);
+  return bits.join(" ");
+}
+
+function AgentChat({
+  pver,
+  mode,
+  alarm,
+  onFocusChange,
+}: {
+  pver: string;
+  mode: "alarm" | "pver";
+  alarm?: string;
+  onFocusChange?: (focus: AgentFocus | null) => void;
+}) {
+  type ChatItem =
+    | { role: "system" | "user" | "assistant"; text: string; kind?: undefined }
+    | { role: "event"; text: string; kind: string; preview?: string };
+
+  const [messages, setMessages] = useState<ChatItem[]>([
     {
       role: "system",
-      text: "Agent workspace. Search an alarm order in the top bar, or talk through this PVER here. Analysis tools will plug into this thread next.",
+      text: "Live triage stream: prep → explorers (tools) → merge → TP/FP → final. Open an alarm, switch to single PVER to watch the graph, then Classify.",
     },
   ]);
   const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const logRef = useRef<HTMLDivElement>(null);
+  const seenEvents = useRef(0);
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [messages]);
+
+  const push = (item: ChatItem) => {
+    setMessages((current) => [...current, item]);
+  };
+
+  const pollClassify = async (order: string) => {
+    seenEvents.current = 0;
+    for (let i = 0; i < 1800; i += 1) {
+      await sleep(800);
+      const job = await api<{
+        status: string;
+        message?: string;
+        events?: PipelineEvent[];
+        focus?: AgentFocus;
+        result?: {
+          verdict?: { label?: string; rationale?: string; votes?: string[] };
+          run_dir?: string;
+          tp?: { claim?: string; witness?: string };
+          fp?: { claim?: string; coverage?: string };
+        };
+      }>(`/api/pvers/${encodeURIComponent(pver)}/alarms/${encodeURIComponent(order)}/classify`);
+
+      if (job.focus) onFocusChange?.(job.focus);
+
+      const events = job.events ?? [];
+      if (events.length > seenEvents.current) {
+        const fresh = events.slice(seenEvents.current);
+        seenEvents.current = events.length;
+        setMessages((current) => [
+          ...current,
+          ...fresh.map((event) => {
+            const preview = event.input_preview || event.output_preview || event.detail || undefined;
+            return {
+              role: "event" as const,
+              kind: event.kind,
+              text: formatEvent(event),
+              preview: preview || undefined,
+            };
+          }),
+        ]);
+      }
+
+      if (job.status === "running") continue;
+      if (job.status === "error") {
+        push({ role: "assistant", text: `Pipeline error: ${job.message || "unknown"}` });
+        onFocusChange?.(null);
+        return;
+      }
+      const v = job.result?.verdict;
+      const lines = [
+        `Verdict: ${v?.label ?? "unknown"}`,
+        v?.rationale ? `Rationale: ${v.rationale}` : "",
+        v?.votes?.length ? `Votes: ${v.votes.join(", ")}` : "",
+        job.result?.tp ? `TP: claim=${job.result.tp.claim} witness=${job.result.tp.witness}` : "",
+        job.result?.fp ? `FP: claim=${job.result.fp.claim} coverage=${job.result.fp.coverage}` : "",
+        job.result?.run_dir ? `Artifacts: ${job.result.run_dir}` : "",
+      ].filter(Boolean);
+      push({ role: "assistant", text: lines.join("\n") });
+      return;
+    }
+    push({ role: "assistant", text: "Timed out waiting for classification." });
+    onFocusChange?.(null);
+  };
+
+  const classify = async () => {
+    if (!pver || !alarm) return;
+    setBusy(true);
+    onFocusChange?.({ agent: "orchestrator", activity: "starting pipeline", functions: [] });
+    push({ role: "user", text: `Classify alarm order ${alarm}` });
+    push({ role: "assistant", text: "Streaming LangGraph pipeline…" });
+    try {
+      await api(`/api/pvers/${encodeURIComponent(pver)}/alarms/${encodeURIComponent(alarm)}/classify`, {
+        method: "POST",
+      });
+      await pollClassify(alarm);
+    } catch (err) {
+      push({ role: "assistant", text: err instanceof Error ? err.message : String(err) });
+      onFocusChange?.(null);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const send = (event: FormEvent) => {
     event.preventDefault();
@@ -443,7 +566,12 @@ function AgentChat({ pver, mode, alarm }: { pver: string; mode: "alarm" | "pver"
     setMessages((current) => [
       ...current,
       { role: "user", text },
-      { role: "assistant", text: "Saved. This chat will drive the next analysis steps." },
+      {
+        role: "assistant",
+        text: alarm
+          ? "Use Classify for a live agent stream. Notes stay in this thread only."
+          : "Open an alarm order in the top bar, then Classify.",
+      },
     ]);
     setDraft("");
   };
@@ -457,19 +585,28 @@ function AgentChat({ pver, mode, alarm }: { pver: string; mode: "alarm" | "pver"
         </div>
         <span className="count-pill">{mode}{alarm ? ` · ${alarm}` : ""}</span>
       </div>
-      <div className="chat-log">
+      <div className="chat-log" ref={logRef}>
         {messages.map((item, index) => (
-          <article className={`chat-bubble ${item.role}`} key={`${item.role}-${index}`}>
-            <span>{item.role}</span>
-            <p>{item.text}</p>
+          <article
+            className={`chat-bubble ${item.role}${item.role === "event" ? ` event ${item.kind}` : ""}`}
+            key={`${item.role}-${index}`}
+          >
+            <span>{item.role === "event" ? item.kind : item.role}</span>
+            <p style={{ whiteSpace: "pre-wrap" }}>{item.text}</p>
+            {"preview" in item && item.preview ? <pre>{item.preview}</pre> : null}
           </article>
         ))}
+      </div>
+      <div className="chat-input" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+        <button type="button" disabled={!pver || !alarm || busy} onClick={() => void classify()}>
+          {busy ? "Streaming…" : "Classify alarm"}
+        </button>
       </div>
       <form className="chat-input" onSubmit={send}>
         <input
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
-          placeholder="ask about this PVER or alarm…"
+          placeholder="notes for this PVER or alarm…"
           disabled={!pver}
         />
         <button type="submit" disabled={!pver || !draft.trim()}>Send</button>
@@ -492,6 +629,7 @@ export default function App() {
   const [opening, setOpening] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [error, setError] = useState("");
+  const [agentFocus, setAgentFocus] = useState<AgentFocus | null>(null);
 
   const refreshPvers = useCallback(async () => {
     const payload = await api<PverListResponse>("/api/pvers");
@@ -618,7 +756,7 @@ export default function App() {
       </header>
 
       <div className="workspace">
-        <AgentChat pver={activePver} mode={mode} alarm={detail?.order_id} />
+        <AgentChat pver={activePver} mode={mode} alarm={detail?.order_id} onFocusChange={setAgentFocus} />
         <section className={`content ${mode === "pver" ? "graph-content" : ""}`}>
           {error && <div className="error-banner"><strong>Could not load</strong><span>{error}</span></div>}
           {opening ? (
@@ -629,7 +767,14 @@ export default function App() {
             </div>
           ) : mode === "pver" ? (
             graph ? (
-              <FullGraph graph={graph} highlight={highlight} detail={detail} pathFilter={pathFilter} onPathFilterChange={setPathFilter} />
+              <FullGraph
+                graph={graph}
+                highlight={highlight}
+                detail={detail}
+                pathFilter={pathFilter}
+                onPathFilterChange={setPathFilter}
+                agentFocus={agentFocus}
+              />
             ) : (
               <div className="center-state empty-main">
                 <span className="empty-icon">⌁</span>

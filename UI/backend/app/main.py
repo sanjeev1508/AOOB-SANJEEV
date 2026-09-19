@@ -886,10 +886,91 @@ _full_graph: dict[str, Any] | None = None
 _active_pver: str | None = None
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
+_agent_jobs: dict[str, dict[str, Any]] = {}
+_agent_jobs_lock = threading.Lock()
 
 
 def get_store() -> AlarmStore | None:
     return _store
+
+
+def _agent_job_key(pver_id: str, order: str) -> str:
+    return f"{pver_id}:{_canonical_order(order)}"
+
+
+def _run_agent_job(pver_id: str, order: str, sequential: bool) -> None:
+    key = _agent_job_key(pver_id, order)
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    try:
+        from aoob_pipeline.orchestrator import run_pipeline
+
+        resolve_order = order
+        store = get_store()
+        if store is not None and _active_pver == pver_id:
+            record = store.get(order)
+            if record:
+                resolve_order = record.get("order_id") or order
+
+        def on_event(payload: dict[str, Any]) -> None:
+            with _agent_jobs_lock:
+                job = _agent_jobs.get(key)
+                if not job:
+                    return
+                events = list(job.get("events") or [])
+                event = payload.get("event") or {}
+                events.append(event)
+                # Keep memory bounded for long tool traces
+                if len(events) > 2000:
+                    events = events[-2000:]
+                job["events"] = events
+                job["focus"] = payload.get("focus") or job.get("focus") or {}
+                job["message"] = event.get("title") or job.get("message")
+                job["event_count"] = len(events)
+
+        with _agent_jobs_lock:
+            _agent_jobs[key] = {
+                "status": "running",
+                "message": "Pipeline running (prep → explore → prove → final)",
+                "pver": pver_id,
+                "order": order,
+                "events": [],
+                "focus": {},
+                "event_count": 0,
+            }
+        result = run_pipeline(
+            pver_id=pver_id,
+            order=resolve_order,
+            project_root=PROJECT_ROOT,
+            parallel_explore=not sequential,
+            parallel_prove=not sequential,
+            on_event=on_event,
+        )
+        with _agent_jobs_lock:
+            job = _agent_jobs.get(key) or {}
+            _agent_jobs[key] = {
+                **job,
+                "status": "done",
+                "message": f"Verdict: {result.verdict.label}",
+                "pver": pver_id,
+                "order": order,
+                "result": result.model_dump(mode="json"),
+                "focus": {
+                    **(job.get("focus") or {}),
+                    "agent": "FINAL_CLASSIFICATION",
+                    "activity": result.verdict.label,
+                },
+            }
+    except Exception as exc:  # noqa: BLE001
+        with _agent_jobs_lock:
+            job = _agent_jobs.get(key) or {}
+            _agent_jobs[key] = {
+                **job,
+                "status": "error",
+                "message": str(exc),
+                "pver": pver_id,
+                "order": order,
+            }
 
 
 @app.get("/api/pvers")
@@ -1087,6 +1168,68 @@ def get_control_flow_graph() -> dict[str, Any]:
         "function_count": len(_cfg_graph),
         "edge_count": sum(len(callees) for callees in _cfg_graph.values()),
     }
+
+
+@app.post("/api/pvers/{pver_id}/alarms/{order_id}/classify")
+def api_start_classify(pver_id: str, order_id: str, sequential: bool = False) -> dict[str, Any]:
+    """Start the LangGraph multi-agent triage pipeline for one alarm order."""
+    folder = _pver_dir(pver_id)
+    if not folder.is_dir():
+        raise HTTPException(status_code=404, detail=f"PVER {pver_id} was not found")
+    var_path = folder / OUTPUT_NAME
+    if not var_path.is_file():
+        raise HTTPException(status_code=409, detail=f"Missing {OUTPUT_NAME}; open/build the PVER first")
+    if not (folder / "input.c").is_file():
+        raise HTTPException(status_code=409, detail="Missing input.c")
+    key = _agent_job_key(pver_id, order_id)
+    with _agent_jobs_lock:
+        current = _agent_jobs.get(key, {})
+        if current.get("status") == "running":
+            return {"status": "running", "message": current.get("message"), "job": key}
+        _agent_jobs[key] = {
+            "status": "running",
+            "message": "Starting pipeline",
+            "pver": pver_id,
+            "order": order_id,
+            "events": [],
+            "focus": {},
+            "event_count": 0,
+        }
+    thread = threading.Thread(
+        target=_run_agent_job,
+        args=(pver_id, order_id, sequential),
+        daemon=True,
+    )
+    thread.start()
+    return {"status": "running", "message": "Classification started", "job": key}
+
+
+@app.get("/api/pvers/{pver_id}/alarms/{order_id}/classify")
+def api_classify_status(pver_id: str, order_id: str) -> dict[str, Any]:
+    key = _agent_job_key(pver_id, order_id)
+    with _agent_jobs_lock:
+        job = dict(_agent_jobs.get(key) or {})
+    if not job:
+        # Fall back to latest on-disk result if present
+        safe = "".join(
+            ch if ch.isalnum() or ch in "._-" else "_" for ch in _canonical_order(order_id)
+        )
+        folder_runs = _pver_dir(pver_id) / "agent_runs" / safe
+        if folder_runs.is_dir():
+            latest = sorted([p for p in folder_runs.iterdir() if p.is_dir()], reverse=True)
+            if latest:
+                result_path = latest[0] / "result.json"
+                if result_path.is_file():
+                    return {
+                        "status": "done",
+                        "message": "Loaded latest saved run",
+                        "pver": pver_id,
+                        "order": order_id,
+                        "result": json.loads(result_path.read_text(encoding="utf-8")),
+                        "run_dir": str(latest[0]),
+                    }
+        raise HTTPException(status_code=404, detail="No classification job for this alarm")
+    return job
 
 
 @app.get("/api/health")

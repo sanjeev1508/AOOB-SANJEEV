@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Graph from "graphology";
 import Sigma from "sigma";
-import { AlarmDetail, GraphHighlight, GraphPayload, VariableInfo } from "./types";
+import { AlarmDetail, AgentFocus, GraphHighlight, GraphPayload, VariableInfo } from "./types";
 import { AccessFilter, executionRole, matchesAccessFilter, orderFunctionsByExecution } from "./cfgOrder";
 import { PathFilter, filterSequencesByVariable, functionKey, sequenceEdges, sequenceNodes, uniqueSequences } from "./paths";
 
@@ -17,6 +17,8 @@ const C = {
   pathEdge: "#65e2b9",
   expandEdge: "#9ca8ff",
   label: "#dce3f6",
+  agent: "#ff7a59",
+  agentEdge: "#ffb08a",
 };
 
 const MAX_EXPAND = 40;
@@ -27,6 +29,7 @@ type Props = {
   detail?: AlarmDetail | null;
   pathFilter: PathFilter;
   onPathFilterChange: (filter: PathFilter) => void;
+  agentFocus?: AgentFocus | null;
 };
 
 function roleColor(role?: string): string {
@@ -99,7 +102,14 @@ function selectedFunctions(info: VariableInfo | undefined): string[] {
   return names.map(functionKey).filter((name) => name && name !== "global");
 }
 
-export default function FullGraph({ graph, highlight, detail, pathFilter, onPathFilterChange }: Props) {
+export default function FullGraph({
+  graph,
+  highlight,
+  detail,
+  pathFilter,
+  onPathFilterChange,
+  agentFocus,
+}: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const graphRef = useRef<Graph | null>(null);
   const sigmaRef = useRef<Sigma | null>(null);
@@ -252,12 +262,34 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
       });
     });
 
+    const agentNodes = new Set(
+      (agentFocus?.functions ?? [])
+        .map((name) => resolveNode(g, name))
+        .filter((name): name is string => Boolean(name)),
+    );
+    const agentEdgeKeys = new Set(
+      (agentFocus?.edges ?? [])
+        .map((edge) => {
+          const from = resolveNode(g, edge.s);
+          const to = resolveNode(g, edge.t);
+          return from && to ? `${from}->${to}` : "";
+        })
+        .filter(Boolean),
+    );
+
     g.forEachNode((id, attrs) => {
       const base = Number(attrs.originalSize || 2);
       const onPath = seqSet.has(id);
       const isExpanded = expanded.has(id);
       const isCallee = calleeOf.has(id);
-      if (onPath) {
+      const isAgent = agentNodes.has(id);
+      if (isAgent) {
+        g.setNodeAttribute(id, "color", C.agent);
+        g.setNodeAttribute(id, "size", Math.max(10, base * 3.2));
+        g.setNodeAttribute(id, "label", id);
+        g.setNodeAttribute(id, "forceLabel", true);
+        g.setNodeAttribute(id, "zIndex", 4);
+      } else if (onPath) {
         const role = roles[id] || (id === highlight?.center ? "alarm" : "hop");
         g.setNodeAttribute(id, "color", isExpanded ? C.expand : roleColor(role));
         g.setNodeAttribute(id, "size", Math.max(role === "alarm" || isExpanded ? 9 : 7, base * 2.8));
@@ -277,8 +309,8 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
         g.setNodeAttribute(id, "forceLabel", true);
         g.setNodeAttribute(id, "zIndex", 2);
       } else {
-        g.setNodeAttribute(id, "color", active ? C.dim : C.base);
-        g.setNodeAttribute(id, "size", active ? Math.max(0.8, base * 0.35) : base);
+        g.setNodeAttribute(id, "color", active || agentNodes.size ? C.dim : C.base);
+        g.setNodeAttribute(id, "size", active || agentNodes.size ? Math.max(0.8, base * 0.35) : base);
         g.setNodeAttribute(id, "label", showAllLabels || !active ? id : "");
         g.setNodeAttribute(id, "forceLabel", showAllLabels);
         g.setNodeAttribute(id, "zIndex", 0);
@@ -288,8 +320,14 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
     g.forEachEdge((id, attrs, source, target) => {
       const onPath = pathEdges.has(id) || pathEdges.has(`${source}->${target}`);
       const isExpand = expandEdges.has(id) || expandEdges.has(`${source}->${target}`);
-      const visible = showEdges || onPath || isExpand;
-      if (onPath) {
+      const isAgent = agentEdgeKeys.has(`${source}->${target}`) || agentEdgeKeys.has(id);
+      const visible = showEdges || onPath || isExpand || isAgent;
+      if (isAgent) {
+        g.setEdgeAttribute(id, "hidden", false);
+        g.setEdgeAttribute(id, "color", C.agentEdge);
+        g.setEdgeAttribute(id, "size", (Number(attrs.originalSize) || 1) * 3.6);
+        g.setEdgeAttribute(id, "zIndex", 3);
+      } else if (onPath) {
         g.setEdgeAttribute(id, "hidden", false);
         g.setEdgeAttribute(id, "color", C.pathEdge);
         g.setEdgeAttribute(id, "size", (Number(attrs.originalSize) || 1) * 3.2);
@@ -301,25 +339,28 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
         g.setEdgeAttribute(id, "zIndex", 1);
       } else {
         g.setEdgeAttribute(id, "hidden", !visible);
-        g.setEdgeAttribute(id, "color", active ? "#152033" : C.edge);
-        g.setEdgeAttribute(id, "size", active ? Math.max(0.2, Number(attrs.originalSize) * 0.35) : attrs.originalSize);
+        g.setEdgeAttribute(id, "color", active || agentNodes.size ? "#152033" : C.edge);
+        g.setEdgeAttribute(id, "size", active || agentNodes.size ? Math.max(0.2, Number(attrs.originalSize) * 0.35) : attrs.originalSize);
         g.setEdgeAttribute(id, "zIndex", 0);
       }
     });
 
-    renderer.setSetting("labelRenderedSizeThreshold", showAllLabels || active || expanded.size ? 0 : 6);
+    renderer.setSetting("labelRenderedSizeThreshold", showAllLabels || active || expanded.size || agentNodes.size ? 0 : 6);
     renderer.refresh();
-  }, [expanded, graph, highlight, sequence, sequences, showAllLabels, showEdges]);
+  }, [agentFocus, expanded, graph, highlight, sequence, sequences, showAllLabels, showEdges]);
 
   useEffect(() => {
     const renderer = sigmaRef.current;
     const g = graphRef.current;
     if (!renderer || !g) return;
+    const agentNames = (agentFocus?.functions ?? [])
+      .map((name) => resolveNode(g, name))
+      .filter((name): name is string => Boolean(name));
     const callees = [...expanded].flatMap((name) => (g.hasNode(name) ? g.outNeighbors(name).slice(0, MAX_EXPAND) : []));
-    const focus = (expanded.size ? [...expanded, ...callees] : sequence)
+    const focus = (agentNames.length ? agentNames : expanded.size ? [...expanded, ...callees] : sequence)
       .filter((id, index, all) => all.indexOf(id) === index && g.hasNode(id));
     if (!focus.length) {
-      if (!highlight?.center) renderer.getCamera().animatedReset({ duration: 400 });
+      if (!highlight?.center && !agentFocus?.functions?.length) renderer.getCamera().animatedReset({ duration: 400 });
       return;
     }
     const points = focus
@@ -334,11 +375,11 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
         angle: 0,
         x: (Math.min(...xs) + Math.max(...xs)) / 2,
         y: (Math.min(...ys) + Math.max(...ys)) / 2,
-        ratio: focus.length === 1 ? 0.1 : expanded.size ? 0.28 : 0.22,
+        ratio: focus.length === 1 ? 0.08 : agentNames.length ? 0.18 : expanded.size ? 0.28 : 0.22,
       },
-      { duration: 320 },
+      { duration: 280 },
     );
-  }, [expanded, graph, highlight, sequence]);
+  }, [agentFocus, expanded, graph, highlight, sequence]);
 
   const fit = () => {
     sigmaRef.current?.getCamera().animatedReset({ duration: 400 });
@@ -384,6 +425,15 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
     <div className="pver-graph-layout">
       <div className="full-graph">
         <div ref={hostRef} className="sigma-host" />
+        {agentFocus?.agent || agentFocus?.activity ? (
+          <div className="agent-live-banner">
+            <strong>{agentFocus.agent || agentFocus.stage || "pipeline"}</strong>
+            <span>{agentFocus.activity || "working"}</span>
+            {agentFocus.functions?.length ? (
+              <em>{agentFocus.functions.slice(0, 4).join(" · ")}{agentFocus.functions.length > 4 ? "…" : ""}</em>
+            ) : null}
+          </div>
+        ) : null}
         <div className="graph-filters">
           <label>
             <input type="checkbox" checked={showAllLabels} onChange={(event) => setShowAllLabels(event.target.checked)} />
@@ -408,6 +458,7 @@ export default function FullGraph({ graph, highlight, detail, pathFilter, onPath
           <span><i className="swatch alarm" /> alarm</span>
           <span><i className="swatch expand" /> expanded</span>
           <span><i className="swatch callee" /> callee</span>
+          <span><i className="swatch agent" /> agent focus</span>
           <span>{graph.file || "full_control_flow_graph.json"} · {graph.stats?.nodes ?? graph.function_count} nodes · {graph.stats?.edges ?? graph.cf_edge_count} edges</span>
           {sequences.length ? (
             <span>{sequences.length} unique paths · {sequence.length} nodes</span>

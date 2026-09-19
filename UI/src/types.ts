@@ -189,3 +189,27 @@ export type CfgResponse = {
   function_count: number;
   edge_count: number;
 };
+
+export type AgentFocus = {
+  agent?: string;
+  stage?: string;
+  activity?: string;
+  functions?: string[];
+  edges?: Array<{ s: string; t: string }>;
+  updated_at?: number;
+};
+
+export type PipelineEvent = {
+  ts?: number;
+  kind: string;
+  agent?: string | null;
+  stage?: string | null;
+  title?: string;
+  detail?: string | null;
+  input_preview?: string | null;
+  output_preview?: string | null;
+  tool?: string | null;
+  functions?: string[];
+  edges?: Array<{ s: string; t: string }>;
+  activity?: string | null;
+};

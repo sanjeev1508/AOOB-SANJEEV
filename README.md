@@ -156,3 +156,18 @@ python -m pytest tests/test_api.py -q
 cd UI
 npx tsc --noEmit -p tsconfig.app.json
 `
+
+---
+
+## Agent triage pipeline
+
+LangGraph multi-agent classification lives in `aoob_pipeline/` (not required for the explorer UI alone).
+
+`powershell
+python -m pip install -r requirements-agent.txt
+python -m aoob_pipeline --pver 4105 --order 1
+# lower VRAM:
+python -m aoob_pipeline --pver 4105 --order 1 --sequential
+`
+
+Stages: deterministic prep → CALL_PATH + VAR_VALUE explorers (tools) → merge/validate → TP/FP prove → final (multi-run). Artifacts write to `PVERs/<id>/agent_runs/<order>/<timestamp>/`. Configure each agent backend/model in `.env`. From the UI, open an alarm and use **Classify alarm**.

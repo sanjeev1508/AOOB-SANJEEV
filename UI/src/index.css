@@ -60,6 +60,30 @@ button { cursor: pointer; }
 .graph-legend .swatch.symbol { background: #e9b76c; }
 .graph-legend .swatch.expand { background: #49d9ad; }
 .graph-legend .swatch.callee { background: #c9a0ff; }
+.graph-legend .swatch.agent { background: #ff7a59; box-shadow: 0 0 8px #ff7a5988; }
+.agent-live-banner {
+  position: absolute; top: 14px; left: 14px; z-index: 5;
+  max-width: min(520px, 70%);
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 12px; border-radius: 10px;
+  background: rgba(18, 10, 8, 0.88); border: 1px solid #ff7a5988;
+  color: #ffe6dc; font-size: 11px; line-height: 1.35;
+  pointer-events: none;
+}
+.agent-live-banner strong { color: #ff7a59; letter-spacing: .04em; text-transform: uppercase; font-size: 10px; }
+.agent-live-banner em { color: #9eb0d4; font-style: normal; font-family: "JetBrains Mono", Consolas, monospace; font-size: 10px; }
+.chat-bubble.event { background: #101827; border-color: #2a3a5c; }
+.chat-bubble.event.agent_input { border-left: 3px solid #5b8def; }
+.chat-bubble.event.agent_thinking { border-left: 3px solid #ffc93c; }
+.chat-bubble.event.tool_call, .chat-bubble.event.tool_result { border-left: 3px solid #c9a0ff; }
+.chat-bubble.event.agent_output { border-left: 3px solid #37d7a5; }
+.chat-bubble.event.stage, .chat-bubble.event.done { border-left: 3px solid #ff7a59; }
+.chat-bubble.event.agent_error { border-left: 3px solid #ff5c7a; }
+.chat-bubble pre {
+  margin: 8px 0 0; padding: 8px; max-height: 160px; overflow: auto;
+  background: #0a0f1a; border-radius: 6px; color: #9eb0d4;
+  font-size: 10px; line-height: 1.35; white-space: pre-wrap;
+}
 .graph-filters { position: absolute; top: 12px; left: 12px; z-index: 3; display: grid; gap: 7px; background: #0f1627d9; border: 1px solid #202c49; border-radius: 7px; padding: 10px 12px; box-shadow: 0 12px 45px #03050b38; }
 .graph-filters label { display: flex; align-items: center; gap: 8px; color: #91a0c7; font-size: 10px; }
 .graph-filters input { accent-color: #49d9ad; }
