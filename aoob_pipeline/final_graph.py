@@ -10,23 +10,10 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
+from aoob_pipeline import prompts
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.llm import build_agent_llm
 from aoob_pipeline.schemas import FinalVerdict, ValidatedReports
-
-FINAL_SYSTEM = """You are FINAL_CLASSIFICATION for Astrée array-OOB triage.
-
-Decide TP, FP, or uncertain from the validated TP and FP reports only.
-Hard rules (you must obey):
-- FP only if coverage is full, every path class is addressed, and no valid TP witness.
-- TP if there is a validated witness (TP claim=tp and witness=found).
-- uncertain on conflict, partial coverage, or missing evidence.
-- Bias toward TP or uncertain over a wrong FP.
-- You may set reexplore_requested=true with a short reexplore_focus ONCE worth of gap.
-
-Return JSON only:
-{"label":"TP"|"FP"|"uncertain","rationale":"...","reexplore_requested":false,"reexplore_focus":null}
-"""
 
 
 class FinalState(TypedDict):
@@ -105,7 +92,7 @@ def _one_final_vote(validated: ValidatedReports, bus: EventBus | None = None, ru
             )
         msg = llm.invoke(
             [
-                SystemMessage(content=FINAL_SYSTEM),
+                SystemMessage(content=prompts.FINAL_CLASSIFICATION),
                 HumanMessage(content=json.dumps(payload, indent=2, ensure_ascii=False)),
             ]
         )

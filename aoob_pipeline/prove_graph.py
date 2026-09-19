@@ -9,41 +9,10 @@ from typing import Any, TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
+from aoob_pipeline import prompts
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.llm import build_agent_llm
 from aoob_pipeline.schemas import MergedPack, ProveReport
-
-TP_SYSTEM = """You are TP_PROVE for Astrée array-OOB triage.
-
-Argue a TRUE POSITIVE only if the merged pack shows a feasible out-of-bounds
-witness on at least one path class. Use ONLY facts in the pack — never invent
-values. Prefer claim=no_credible_case when evidence is missing.
-
-TP policy: type-legal C input may produce OOB (not only 'realistic' range)
-unless the pack notes otherwise.
-
-Return JSON only with keys:
-claim (tp|no_credible_case), index_range (constant|guard_bounded|unknown),
-array_size (known|unknown), witness (found|none), coverage (full|partial),
-findings (list of {function,line,quote,path_class_id,note}),
-missing_evidence (string[]), addressed_path_classes (string[]),
-unaddressed_path_classes (string[]), rationale (string).
-"""
-
-FP_SYSTEM = """You are FP_PROVE for Astrée array-OOB triage.
-
-Argue a FALSE POSITIVE only with a safety argument covering EVERY path class
-(guards/clamps/masks/loop bounds). Use ONLY facts in the pack — never invent
-values. List any path class you could not cover in unaddressed_path_classes.
-Prefer claim=no_credible_case when coverage is incomplete.
-
-Return JSON only with keys:
-claim (fp|no_credible_case), index_range (constant|guard_bounded|unknown),
-array_size (known|unknown), witness (found|none), coverage (full|partial),
-findings (list of {function,line,quote,path_class_id,note}),
-missing_evidence (string[]), addressed_path_classes (string[]),
-unaddressed_path_classes (string[]), rationale (string).
-"""
 
 
 class ProveState(TypedDict):
@@ -191,8 +160,8 @@ def _run_prove(
 
 
 def run_tp_prove(merged: MergedPack, bus: EventBus | None = None) -> ProveReport:
-    return _run_prove("TP_PROVE", TP_SYSTEM, merged, bus=bus)
+    return _run_prove("TP_PROVE", prompts.TP_PROVE, merged, bus=bus)
 
 
 def run_fp_prove(merged: MergedPack, bus: EventBus | None = None) -> ProveReport:
-    return _run_prove("FP_PROVE", FP_SYSTEM, merged, bus=bus)
+    return _run_prove("FP_PROVE", prompts.FP_PROVE, merged, bus=bus)

@@ -60,10 +60,13 @@ def merge_packs(
     notes = list(prep.notes)
     if unattached:
         notes.append(f"{len(unattached)} facts not tied to a path-class function")
-    # If explorers returned nothing useful and no local guard, mark partial.
+    # If explorers returned nothing useful and no local guard / seeds, mark partial.
     if not call_facts and not var_facts and not prep.local_guard.found:
         coverage = "partial"
         notes.append("explorers produced no verified facts")
+    elif call_facts or var_facts:
+        # Verified facts exist — keep prep coverage_cap unless already partial.
+        pass
 
     return MergedPack(
         prep=prep,

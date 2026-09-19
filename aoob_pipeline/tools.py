@@ -1,4 +1,4 @@
-"""LangChain tools bound per-run to a ``SourceIndex`` (safe for parallel graphs)."""
+"""LangChain tools: move/get over a function sequence + submit with visit gate."""
 
 from __future__ import annotations
 
@@ -7,24 +7,62 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 
+from aoob_pipeline.session import ExploreCursor
 from aoob_pipeline.source_index import SourceIndex
 
 
-def make_explore_tools(source: SourceIndex) -> tuple[list[StructuredTool], dict[str, Any]]:
-    """Return (tools, sink). ``sink['pack']`` is set by ``submit_explore_pack``."""
-    sink: dict[str, Any] = {"pack": None}
+def _clip_snippet(payload: dict[str, Any], limit: int = 24000) -> dict[str, Any]:
+    snippet = payload.get("snippet") or ""
+    if len(snippet) <= limit:
+        return payload
+    out = dict(payload)
+    out["snippet"] = snippet[:limit] + "\n/* ... truncated ... */"
+    out["truncated"] = True
+    return out
+
+
+def make_explore_tools(
+    source: SourceIndex,
+    cursor: ExploreCursor,
+) -> tuple[list[StructuredTool], dict[str, Any]]:
+    """Return (tools, sink). ``sink['pack']`` set only on accepted submit."""
+    sink: dict[str, Any] = {"pack": None, "rejects": []}
+
+    def visit_status() -> str:
+        """Show current index, opened functions, and remaining required visits."""
+        return json.dumps(cursor.status(), ensure_ascii=False)
+
+    def move_func(direction: str = "next", step: int = 0) -> str:
+        """Move the sequence cursor. direction=next|prev, or step=1-based index. Does not return source — call get_current next."""
+        return json.dumps(cursor.move(direction=direction, step=step), ensure_ascii=False)
+
+    def get_current() -> str:
+        """Return the FULL body of the current sequence function and mark it visited."""
+        name = cursor.current()
+        if not name:
+            return json.dumps({"error": "function_sequence is empty"})
+        payload = source.get_func(name)
+        if payload.get("error"):
+            # Still mark attempted so we do not soft-lock on missing spans.
+            cursor.mark_opened(name)
+            return json.dumps({**payload, "visit_status": cursor.status()}, ensure_ascii=False)
+        cursor.mark_opened(name)
+        body = _clip_snippet(payload)
+        body["visit_status"] = cursor.status()
+        return json.dumps(body, ensure_ascii=False)
 
     def get_func(name: str, window: int = 0, near_line: int = 0) -> str:
-        """Return source for a C function. Optional window around near_line (0 = full body)."""
+        """Return source for a named C function. Marks it visited if it is in the sequence."""
         win = window if window and window > 0 else None
         near = near_line if near_line and near_line > 0 else None
         payload = source.get_func(name, window=win, near_line=near)
-        snippet = payload.get("snippet") or ""
-        if len(snippet) > 24000:
-            payload = dict(payload)
-            payload["snippet"] = snippet[:24000] + "\n/* ... truncated ... */"
-            payload["truncated"] = True
-        return json.dumps(payload, ensure_ascii=False)
+        if name in cursor.sequence:
+            cursor.mark_opened(name)
+        body = _clip_snippet(payload) if not payload.get("error") else payload
+        if isinstance(body, dict):
+            body = dict(body)
+            body["visit_status"] = cursor.status()
+        return json.dumps(body, ensure_ascii=False)
 
     def get_lines(start: int, end: int) -> str:
         """Return raw 1-based source lines from start to end inclusive (max 400 lines)."""
@@ -40,18 +78,33 @@ def make_explore_tools(source: SourceIndex) -> tuple[list[StructuredTool], dict[
                 "start": start_i,
                 "end": end_i,
                 "snippet": "\n".join(f"{ln}: {txt}" for ln, txt in rows),
+                "visit_status": cursor.status(),
             },
             ensure_ascii=False,
         )
 
     def submit_explore_pack(facts_json: str, notes_json: str = "[]") -> str:
-        """Finish exploration. facts_json: JSON list of {kind,function,line,quote,...}."""
+        """Finish exploration after ALL sequence functions were opened. facts_json: JSON list of {kind,function,line,quote,...}."""
+        remaining = cursor.remaining()
+        if remaining:
+            msg = {
+                "accepted": False,
+                "error": "Cannot submit yet — open every sequence function with get_current/get_func first.",
+                "remaining": remaining,
+                "visit_status": cursor.status(),
+            }
+            sink["rejects"].append(msg)
+            return json.dumps(msg, ensure_ascii=False)
         try:
             facts = json.loads(facts_json)
         except json.JSONDecodeError as exc:
-            return json.dumps({"accepted": False, "error": f"facts_json not valid JSON: {exc}"})
+            msg = {"accepted": False, "error": f"facts_json not valid JSON: {exc}"}
+            sink["rejects"].append(msg)
+            return json.dumps(msg)
         if not isinstance(facts, list):
-            return json.dumps({"accepted": False, "error": "facts_json must be a JSON array"})
+            msg = {"accepted": False, "error": "facts_json must be a JSON array"}
+            sink["rejects"].append(msg)
+            return json.dumps(msg)
         try:
             notes = json.loads(notes_json) if notes_json else []
         except json.JSONDecodeError:
@@ -75,10 +128,21 @@ def make_explore_tools(source: SourceIndex) -> tuple[list[StructuredTool], dict[
                     "note": item.get("note"),
                 }
             )
+        if not cleaned:
+            msg = {
+                "accepted": False,
+                "error": "Empty facts rejected — quote at least one real line from opened function bodies.",
+                "visit_status": cursor.status(),
+            }
+            sink["rejects"].append(msg)
+            return json.dumps(msg, ensure_ascii=False)
         sink["pack"] = {"facts": cleaned, "notes": [str(n) for n in notes]}
-        return json.dumps({"accepted": True, "fact_count": len(cleaned)})
+        return json.dumps({"accepted": True, "fact_count": len(cleaned), "visit_status": cursor.status()})
 
     tools = [
+        StructuredTool.from_function(visit_status),
+        StructuredTool.from_function(move_func),
+        StructuredTool.from_function(get_current),
         StructuredTool.from_function(get_func),
         StructuredTool.from_function(get_lines),
         StructuredTool.from_function(submit_explore_pack),
