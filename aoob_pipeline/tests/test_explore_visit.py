@@ -11,7 +11,7 @@ from aoob_pipeline.session import ExploreCursor
 from aoob_pipeline.source_index import SourceIndex
 from aoob_pipeline.tools import make_explore_tools
 
-
+ 
 def test_move_get_submit_requires_full_visit(tmp_path: Path) -> None:
     src = tmp_path / "input.c"
     src.write_text(

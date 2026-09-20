@@ -7,6 +7,7 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 
+from aoob_pipeline.pseudocode import enrich_func_payload
 from aoob_pipeline.session import ExploreCursor
 from aoob_pipeline.source_index import SourceIndex
 
@@ -21,12 +22,27 @@ def _clip_snippet(payload: dict[str, Any], limit: int = 24000) -> dict[str, Any]
     return out
 
 
+def _prepare_body(
+    payload: dict[str, Any],
+    *,
+    focus_tokens: set[str] | None = None,
+) -> dict[str, Any]:
+    """Compress C → pseudocode+cite before the LLM sees the tool result."""
+    if payload.get("error"):
+        return payload
+    body = enrich_func_payload(payload, focus_tokens=focus_tokens)
+    return _clip_snippet(body)
+
+
 def make_explore_tools(
     source: SourceIndex,
     cursor: ExploreCursor,
+    *,
+    focus_tokens: set[str] | None = None,
 ) -> tuple[list[StructuredTool], dict[str, Any]]:
     """Return (tools, sink). ``sink['pack']`` set only on accepted submit."""
     sink: dict[str, Any] = {"pack": None, "rejects": []}
+    focus = focus_tokens
 
     def visit_status() -> str:
         """Show current index, opened functions, and remaining required visits."""
@@ -37,7 +53,7 @@ def make_explore_tools(
         return json.dumps(cursor.move(direction=direction, step=step), ensure_ascii=False)
 
     def get_current() -> str:
-        """Return the FULL body of the current sequence function and mark it visited."""
+        """Return compact pseudocode + citeable C lines for the current sequence function and mark it visited."""
         name = cursor.current()
         if not name:
             return json.dumps({"error": "function_sequence is empty"})
@@ -47,18 +63,18 @@ def make_explore_tools(
             cursor.mark_opened(name)
             return json.dumps({**payload, "visit_status": cursor.status()}, ensure_ascii=False)
         cursor.mark_opened(name)
-        body = _clip_snippet(payload)
+        body = _prepare_body(payload, focus_tokens=focus)
         body["visit_status"] = cursor.status()
         return json.dumps(body, ensure_ascii=False)
 
     def get_func(name: str, window: int = 0, near_line: int = 0) -> str:
-        """Return source for a named C function. Marks it visited if it is in the sequence."""
+        """Return compact pseudocode + citeable C for a named function. Marks visited if in sequence."""
         win = window if window and window > 0 else None
         near = near_line if near_line and near_line > 0 else None
         payload = source.get_func(name, window=win, near_line=near)
         if name in cursor.sequence:
             cursor.mark_opened(name)
-        body = _clip_snippet(payload) if not payload.get("error") else payload
+        body = _prepare_body(payload, focus_tokens=focus) if not payload.get("error") else payload
         if isinstance(body, dict):
             body = dict(body)
             body["visit_status"] = cursor.status()

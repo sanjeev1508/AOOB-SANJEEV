@@ -26,6 +26,7 @@ from aoob_pipeline.llm import build_agent_llm
 from aoob_pipeline.schemas import ExplorePack, Fact, PrepPack
 from aoob_pipeline.session import ExploreCursor
 from aoob_pipeline.source_index import SourceIndex
+from aoob_pipeline.pseudocode import enrich_func_payload
 from aoob_pipeline.tools import make_explore_tools
 
 
@@ -65,8 +66,8 @@ def _prep_brief(
             if code_driven
             else [
                 "Start at step 1 (already positioned).",
-                "Call get_current() to load the FULL current function.",
-                "Extract quoted facts from that body.",
+                "Call get_current() to load the current function (pseudocode + CITE lines).",
+                "Extract facts: copy quotes ONLY from the CITE block (exact C).",
                 "Call move_func(direction='next') and repeat until remaining=[].",
                 "Call visit_status() anytime to check coverage.",
                 "Then submit_explore_pack with a non-empty facts array.",
@@ -270,7 +271,7 @@ def _fallback_facts_from_bodies(
     facts: list[Fact] = []
     needles = [x for x in [prep.index_expression, prep.array_name] if x]
     for name, body in zip(sequence, bodies):
-        snippet = str(body.get("snippet") or "")
+        snippet = str(body.get("raw_snippet") or body.get("snippet") or "")
         if body.get("error") or not snippet:
             continue
         for line in snippet.splitlines():
@@ -282,7 +283,7 @@ def _fallback_facts_from_bodies(
             except ValueError:
                 continue
             text = text.strip()
-            if not text:
+            if not text or text.startswith("PSEUDO") or text.startswith("CITE") or text.startswith("#"):
                 continue
             if needles and not any(n in text for n in needles):
                 continue
@@ -368,13 +369,14 @@ def _run_explore_code_driven(
         body = source.get_func(name, near_line=prep.alarm_line if name == prep.enclosing_function else None)
         opened.append(name)
         if bus:
+            preview = str(body.get("snippet") or body.get("error") or "")
             bus.emit(
                 "tool_result",
                 agent=agent,
                 stage="explore",
                 title=f"{agent} ← get_func({name})",
                 tool="get_func",
-                output_preview=str(body.get("snippet") or body.get("error") or "")[:1200],
+                output_preview=preview[:1200],
                 functions=[name],
                 activity=f"opened {name}",
             )
@@ -383,41 +385,60 @@ def _run_explore_code_driven(
             all_facts.append(f)
 
         # Small LLM pass: extract additional quoted facts from this body only
-        snippet = str(body.get("snippet") or "")
-        if snippet and not body.get("error"):
-            if bus:
-                bus.emit(
-                    "agent_thinking",
-                    agent=agent,
-                    stage="explore",
-                    title=f"{agent} extract @ {name}",
-                    activity="JSON fact extract (no tools)",
-                    functions=[name],
-                )
-            human = (
-                f"function={name}\nrole={role}\n"
-                f"index_expression={prep.index_expression}\n"
-                f"index_tokens={sorted(t for t in relevant if t != prep.array_name and t not in sequence)}\n"
-                f"array={prep.array_name}\narray_size={prep.array_size}\n"
-                f"alarm_line={prep.alarm_line}\n"
-                f"SNIPPET (line: text):\n{snippet[:20000]}"
+        if body.get("error") or not body.get("snippet"):
+            continue
+        enriched = enrich_func_payload(body, focus_tokens=relevant)
+        llm_view = str(enriched.get("snippet") or "")
+        if not llm_view:
+            continue
+        if bus:
+            bus.emit(
+                "agent_thinking",
+                agent=agent,
+                stage="explore",
+                title=f"{agent} extract @ {name}",
+                activity="JSON fact extract on pseudocode+cite (no tools)",
+                functions=[name],
             )
-            try:
-                llm = build_agent_llm(agent, prompt_chars=len(extract_system) + len(human))
-                msg = llm.invoke(
-                    [SystemMessage(content=extract_system), HumanMessage(content=human)]
+            ratio = enriched.get("compress_ratio")
+            bus.emit(
+                "tool_result",
+                agent=agent,
+                stage="explore",
+                title=f"{agent} ← pseudo({name})",
+                tool="pseudocode",
+                output_preview=llm_view[:1200],
+                functions=[name],
+                activity=(
+                    f"compressed {enriched.get('original_chars')}→"
+                    f"{enriched.get('compressed_chars')} chars"
+                    + (f" ({ratio})" if ratio is not None else "")
+                ),
+            )
+        human = (
+            f"function={name}\nrole={role}\n"
+            f"index_expression={prep.index_expression}\n"
+            f"index_tokens={sorted(t for t in relevant if t != prep.array_name and t not in sequence)}\n"
+            f"array={prep.array_name}\narray_size={prep.array_size}\n"
+            f"alarm_line={prep.alarm_line}\n"
+            f"BODY (PSEUDO for logic; CITE for exact quotes):\n{llm_view[:16000]}"
+        )
+        try:
+            llm = build_agent_llm(agent, prompt_chars=len(extract_system) + len(human))
+            msg = llm.invoke(
+                [SystemMessage(content=extract_system), HumanMessage(content=human)]
+            )
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            for item in _extract_json_list(content):
+                fact = normalize_llm_fact(
+                    item, function=name, prep=prep, source=source, relevant=relevant
                 )
-                content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                for item in _extract_json_list(content):
-                    fact = normalize_llm_fact(
-                        item, function=name, prep=prep, source=source, relevant=relevant
-                    )
-                    if fact is None:
-                        dropped_llm += 1
-                        continue
-                    all_facts.append(fact)
-            except Exception as exc:  # noqa: BLE001
-                notes.append(f"extract_failed@{name}:{exc}")
+                if fact is None:
+                    dropped_llm += 1
+                    continue
+                all_facts.append(fact)
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"extract_failed@{name}:{exc}")
 
     if dropped_llm:
         notes.append(f"dropped {dropped_llm} irrelevant/unverifiable LLM facts")
@@ -503,7 +524,8 @@ def _run_explore(
         )
 
     cursor = ExploreCursor(sequence=list(sequence))
-    tools, sink = make_explore_tools(source, cursor)
+    focus = relevance_tokens(prep, sequence)
+    tools, sink = make_explore_tools(source, cursor, focus_tokens=focus)
     llm = build_agent_llm(agent)
     rounds = max(max_rounds, max(8, len(sequence) * 3 + 4))
     graph = _build_explore_graph(

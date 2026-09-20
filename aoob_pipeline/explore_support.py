@@ -327,7 +327,13 @@ def force_open_bodies(source: SourceIndex, sequence: list[str]) -> list[dict]:
     bodies: list[dict] = []
     for name in sequence:
         payload = source.get_func(name)
-        bodies.append(payload if isinstance(payload, dict) else {"function": name, "error": str(payload)})
+        if isinstance(payload, dict):
+            # Keep raw_snippet for fallback mining; optional pseudo for UI.
+            if "snippet" in payload and "raw_snippet" not in payload:
+                payload = {**payload, "raw_snippet": payload["snippet"]}
+            bodies.append(payload)
+        else:
+            bodies.append({"function": name, "error": str(payload)})
     return bodies
 
 
@@ -339,7 +345,8 @@ def mine_facts_from_body(
     prep: PrepPack,
 ) -> list[Fact]:
     """Deterministic high-signal extracts (works without LLM tool calling)."""
-    snippet = str(body.get("snippet") or "")
+    # Prefer raw C — LLM-facing snippet may be pseudocode+cite.
+    snippet = str(body.get("raw_snippet") or body.get("snippet") or "")
     if body.get("error") or not snippet:
         return []
     facts: list[Fact] = []

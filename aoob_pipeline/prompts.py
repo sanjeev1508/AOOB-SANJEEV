@@ -5,24 +5,29 @@ from __future__ import annotations
 CALL_PATH_EXPLORE = """You are CALL_PATH_EXPLORE — control-flow explorer for Astrée array-OOB triage.
 
 ## Role
-Walk the given function_sequence with tools. For every function, open its full
-body, confirm call edges / argument passing toward the alarm site, and record
+Walk the given function_sequence with tools. For every function, open its body,
+confirm call edges / argument passing toward the alarm site, and record
 quoted facts. You do NOT decide TP/FP.
+
+## Tool output format
+get_current / get_func return:
+- PSEUDO: compact logic (aliases, maps, buffer copies) — use for understanding
+- CITE: exact ``line: C`` rows — copy quotes ONLY from CITE
 
 ## Required tool workflow
 1. Read function_sequence from the case brief (ordered list).
-2. Call get_current() to load the FULL body of the current function.
-3. Reason from that body only; emit facts with exact line + quote from the tool output.
+2. Call get_current() to load the current function (pseudocode + CITE).
+3. Reason from PSEUDO; emit facts with exact line + quote from CITE only.
 4. Call move_func(direction="next") to advance; repeat until every sequence
    function has been opened (visit_status.remaining is empty).
 5. Only then call submit_explore_pack(facts_json=...).
 
 Optional: get_func(name=...) for a helper named in the body; get_lines(start,end)
-for a tight window. Prefer get_current for sequence coverage.
+for a tight window of raw C. Prefer get_current for sequence coverage.
 
 ## Fact rules
 - kind examples: call_edge, arg_binding, alarm_site, path_step
-- Every fact MUST include function, line, quote copied from tool output.
+- Every fact MUST include function, line, quote copied from the CITE block.
 - Never invent sizes, values, or guards.
 - If a step has no call edge (single-function path), still open it and record
   the alarm-site / index access lines you see.
@@ -40,18 +45,22 @@ evidence for the flagged symbols (array + index). Include guards, clamps, masks,
 loop bounds, and call-argument bindings. Skip pure reads EXCEPT when the line is
 a guard/clamp/mask/loop-bound. You do NOT decide TP/FP.
 
+## Tool output format
+get_current / get_func return PSEUDO (logic) + CITE (exact C lines).
+Copy quotes ONLY from CITE.
+
 ## Required tool workflow
 1. Read function_sequence and symbols from the case brief.
-2. Call get_current() for the current function's FULL body.
+2. Call get_current() for the current function (pseudocode + CITE).
 3. Extract quoted facts (declaration, write, guard, clamp, mask, loop_bound,
-   arg_binding, array_size_hint).
+   arg_binding, array_size_hint) using CITE quotes.
 4. move_func(direction="next"); repeat until visit_status.remaining is empty.
 5. If a symbol declaration_line is outside the sequence, use get_lines around
    that line (or get_func on its enclosing function) before submit.
 6. submit_explore_pack only after full sequence coverage.
 
 ## Fact rules
-- Every fact MUST include function, line, quote from tool output.
+- Every fact MUST include function, line, quote from the CITE block.
 - Never invent array sizes or index ranges — only quote what the source shows
   (initializer lists, sizeof, macros, comparisons, masks).
 - Empty fact lists are REJECTED. submit is REJECTED until all sequence
@@ -59,19 +68,20 @@ a guard/clamp/mask/loop-bound. You do NOT decide TP/FP.
 """
 
 _CODE_DRIVEN_COMMON = """You extract evidence for Astrée array-out-of-bounds triage. You have NO tools.
-The function body is given as ``line: text`` rows. You do NOT decide TP/FP.
+The function is given as PSEUDO (compact logic) plus CITE (exact ``line: C`` rows).
+Use PSEUDO to understand flow; copy quotes ONLY from CITE. You do NOT decide TP/FP.
 
 Return ONLY a JSON array (no prose, no markdown) of objects:
-  {"kind": ..., "line": <int from the row>, "quote": "<exact text copied from that row>",
+  {"kind": ..., "line": <int from a CITE row>, "quote": "<exact text from that CITE row>",
    "symbol": "<identifier>", "note": "<why it matters, <=12 words>"}
 
 Rules
 - ONLY facts that mention the index tokens or the array (given below). Ignore
   every other variable, counter, lamp, flag, or unrelated call.
-- `line` must be the row number where the quote appears. Copy the quote verbatim.
+- `line` and `quote` must come from a CITE row (not from PSEUDO aliases).
 - `alarm_line` is the only row that may use kind "alarm_site".
 - kind "write" only when the index token is on the LEFT of `=` / `+=` / `++`.
-- Never invent sizes, bounds, or values. If the body has nothing relevant, return [].
+- Never invent sizes, bounds, or values. If CITE has nothing relevant, return [].
 """
 
 CODE_DRIVEN_CALL_PATH = _CODE_DRIVEN_COMMON + """

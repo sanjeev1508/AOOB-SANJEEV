@@ -58,6 +58,7 @@ AOOB-9-9/
 │   ├── prep.py                    # deterministic skeletons + size recovery
 │   ├── explore_graph.py           # CALL_PATH + VAR_VALUE explorers
 │   ├── explore_support.py         # sequences, seeds, body mining
+│   ├── pseudocode.py              # C to PSEUDO+CITE for LLM context
 │   ├── tools.py / session.py      # move/get visit cursor + tools
 │   ├── merge.py / validate.py     # packs + quote scrubbing
 │   ├── prove_graph.py             # TP_PROVE + FP_PROVE (no tools)
@@ -278,7 +279,16 @@ Each agent has its own backend/model in `.env`
 | **`code_driven`** (default) | Python walks every required function, opens full bodies, mines quotes; LLM extracts structured facts only | Small models (e.g. 7B) that fail tool-calling |
 | **`tool_agent`** | LLM must call `get_current` / `move_func` / `submit_explore_pack` itself | Strong tool-calling models |
 
-In both modes:
+### Pseudocode compression (`AOOB_PSEUDOCODE`, default on)
+
+Before the LLM sees a function body (code-driven extract **or** `get_current`/`get_func`), the pipeline converts C into:
+
+1. **PSEUDO** — lossy but logic-preserving DSL (aliases, `map(state){...}`, buffer copies, collapsed `EMS[0..6]` assigns)
+2. **CITE** — short exact `line: C` rows for verifiable quotes
+
+Deterministic mining and quote verification still use raw C (`raw_snippet`). Set `AOOB_PSEUDOCODE=0` to send full C.
+
+In both explore modes:
 
 - A **visit cursor** requires every function in the sequence to be opened.
 - Deterministic **seed facts** always include array/index declarations and the
@@ -293,8 +303,8 @@ In both modes:
 |------|---------|
 | `visit_status` | Current index, opened set, remaining |
 | `move_func` | `next` / `prev` / absolute step (no source) |
-| `get_current` | Full body of current sequence function; marks visited |
-| `get_func` | Named function body; marks visited if in sequence |
+| `get_current` | PSEUDO+CITE for current sequence function; marks visited |
+| `get_func` | Named function PSEUDO+CITE; marks visited if in sequence |
 | `get_lines` | Raw line range (capped) |
 | `submit_explore_pack` | Accept pack only if visit gate passes and facts non-empty |
 
@@ -326,6 +336,7 @@ Wrong **FP** is treated as the worst error (hides a real bug). Defaults:
 | `AOOB_MAX_TOOL_ROUNDS` | `12` | Explorer LangGraph tool-loop budget |
 | `AOOB_MAX_REEXPLORE` | `1` | Bounded re-explore if final requests it |
 | `AOOB_EXPLORE_MODE` | `code_driven` | See above |
+| `AOOB_PSEUDOCODE` | `1` | Compress bodies to PSEUDO+CITE before LLM |
 | `AOOB_FP_PRECISION_MODE` | `strict` | Ironclad FP gate |
 | `AOOB_TP_POLICY` | `type_legal` | Witness policy |
 | `AOOB_OLLAMA_RUNTIME_FALLBACK` | `1` | Fallback if an Ollama agent fails |
@@ -377,6 +388,7 @@ PVERs/<id>/agent_runs/<order>/<UTC-timestamp>/
 | `source_index.py` | Line/function spans over `input.c` + quote verify |
 | `explore_graph.py` | Explorer LangGraphs + code_driven path |
 | `explore_support.py` | Sequences, seeds, body mining |
+| `pseudocode.py` | C to PSEUDO+CITE compressor for explorer LLM context |
 | `merge.py` | Combined pack + coverage |
 | `prove_graph.py` | TP/FP LangGraphs |
 | `validate.py` | Drop uncited findings |
