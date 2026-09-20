@@ -41,28 +41,27 @@ VAR_VALUE_EXPLORE = """You are VAR_VALUE_EXPLORE — data/value explorer for Ast
 
 ## Role
 Walk the given function_sequence and gather declaration / write / value-shaping
-evidence for the flagged symbols (array + index). Include guards, clamps, masks,
-loop bounds, and call-argument bindings. Skip pure reads EXCEPT when the line is
-a guard/clamp/mask/loop-bound. You do NOT decide TP/FP.
+evidence for EVERY flagged symbol in the dataflow list (array + index + siblings).
+Include guards, clamps, masks, loop bounds, and call-argument bindings. Skip pure
+reads EXCEPT when the line is a guard/clamp/mask/loop-bound. You do NOT decide TP/FP.
+Tag each fact with the exact ``symbol`` it concerns.
 
 ## Tool output format
 get_current / get_func return PSEUDO (logic) + CITE (exact C lines).
 Copy quotes ONLY from CITE.
 
 ## Required tool workflow
-1. Read function_sequence and symbols from the case brief.
+1. Read function_sequence and symbols / symbol_paths from the case brief.
 2. Call get_current() for the current function (pseudocode + CITE).
-3. Extract quoted facts (declaration, write, guard, clamp, mask, loop_bound,
-   arg_binding, array_size_hint) using CITE quotes.
+3. Extract quoted facts for all symbols that appear in this body.
 4. move_func(direction="next"); repeat until visit_status.remaining is empty.
 5. If a symbol declaration_line is outside the sequence, use get_lines around
    that line (or get_func on its enclosing function) before submit.
 6. submit_explore_pack only after full sequence coverage.
 
 ## Fact rules
-- Every fact MUST include function, line, quote from the CITE block.
-- Never invent array sizes or index ranges — only quote what the source shows
-  (initializer lists, sizeof, macros, comparisons, masks).
+- Every fact MUST include function, line, quote from the CITE block, and symbol.
+- Never invent array sizes or index ranges — only quote what the source shows.
 - Empty fact lists are REJECTED. submit is REJECTED until all sequence
   functions were opened.
 """
@@ -92,13 +91,15 @@ Focus (call_path): how the index value reaches the alarm through this function:
 """
 
 CODE_DRIVEN_VAR_VALUE = _CODE_DRIVEN_COMMON + """
-Focus (var_value): where the index value comes from and what bounds it:
-- kind "declaration": declaration / parameter of an index token or the array.
-- kind "write": assignment to an index token (quote the whole statement).
-- kind "guard" / "clamp" / "mask" / "loop_bound": a comparison, min/max, `& mask`,
-  `% n` or loop condition on an index token.
+Focus (var_value): EVERY symbol listed in the case brief (array, index, and any
+other dataflow symbols). For each symbol that appears in this body:
+- kind "declaration": declaration / parameter of that symbol.
+- kind "write": assignment to that symbol (quote the whole statement).
+- kind "guard" / "clamp" / "mask" / "loop_bound": bound on an index token.
 - kind "array_size_hint": array size in a declaration, initializer, sizeof, or macro.
-- kind "arg_binding": the argument expression bound to the index parameter at a call.
+- kind "arg_binding": argument expression bound to an index parameter at a call.
+Always set ``symbol`` to the identifier you are talking about. Cover all symbols
+that this function mentions — do not stop after the first one.
 """
 
 

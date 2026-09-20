@@ -9,6 +9,8 @@ Each analysis unit is a **PVER** folder with a fixed file layout. The
 (`aoob_pipeline/`) classifies alarms as TP / FP / uncertain under a
 never-miss-TP policy.
 
+For the full implemented design (detailed diagrams, schemas, APIs, feature inventory), see **[IMPLEMENTATION.md](IMPLEMENTATION.md)**.
+
 `PVERs/4105` and `PVERs/5901` are samples only. Any folder that follows the
 same contract must work the same way.
 

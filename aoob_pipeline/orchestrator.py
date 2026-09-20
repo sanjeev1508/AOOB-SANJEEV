@@ -11,6 +11,13 @@ from aoob_pipeline.artifacts import run_dir, write_json
 from aoob_pipeline.config import pipeline_config
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.explore_graph import run_call_path_explore, run_var_value_explore
+from aoob_pipeline.explore_support import (
+    call_path_edges,
+    call_path_sequence,
+    compact_explore_pack,
+    dataflow_symbol_paths,
+    var_value_sequence,
+)
 from aoob_pipeline.final_graph import run_final_classification
 from aoob_pipeline.merge import merge_packs
 from aoob_pipeline.prep import build_prep, load_alarm
@@ -98,6 +105,10 @@ def run_pipeline(
     )
 
     explore_mode = (os.getenv("AOOB_EXPLORE_MODE") or "code_driven").strip().lower()
+    cp_seq = call_path_sequence(prep)
+    vv_seq = var_value_sequence(prep, source)
+    cp_edges = call_path_edges(prep)
+    sym_paths = dataflow_symbol_paths(prep)
     bus.emit(
         "stage",
         stage="explore",
@@ -105,9 +116,37 @@ def run_pipeline(
         detail=(
             "CALL_PATH_EXPLORE + VAR_VALUE_EXPLORE "
             + ("(code-driven: Python opens bodies, LLM extracts)" if explore_mode.startswith("code") else "(LangGraph + tools)")
+            + " — both must finish before merge/prove"
         ),
         activity="explore fan-out",
-        functions=list(dict.fromkeys(path_funcs)),
+        functions=cp_seq,
+        edges=cp_edges,
+        call_path={"sequence": cp_seq, "edges": cp_edges},
+        var_paths=sym_paths,
+        cursor={
+            "current": cp_seq[0] if cp_seq else None,
+            "index": 1 if cp_seq else 0,
+            "total": len(cp_seq),
+            "sequence": cp_seq,
+        },
+        agent="CALL_PATH_EXPLORE",
+    )
+    # Seed VAR cursor at its first function so both markers appear immediately
+    bus.emit(
+        "stage",
+        stage="explore",
+        title="VAR_VALUE track ready",
+        activity=f"symbols={[s.symbol_name for s in prep.symbols]} seq={len(vv_seq)}",
+        functions=vv_seq[:1] if vv_seq else [],
+        agent="VAR_VALUE_EXPLORE",
+        var_paths=sym_paths,
+        cursor={
+            "current": vv_seq[0] if vv_seq else None,
+            "index": 1 if vv_seq else 0,
+            "total": len(vv_seq),
+            "sequence": vv_seq,
+            "symbols": [s.symbol_name for s in prep.symbols],
+        },
     )
 
     if parallel_explore:
@@ -128,6 +167,9 @@ def run_pipeline(
             prep, source, max_rounds=cfg.max_tool_rounds, bus=bus
         )
 
+    # Both explorers finished — compact again then merge (never prove with only one side)
+    call_pack = compact_explore_pack(call_pack, role="call_path")
+    var_pack = compact_explore_pack(var_pack, role="var_value")
     write_json(out / "02_call_path_explore.json", call_pack)
     write_json(out / "02_var_value_explore.json", var_pack)
 
@@ -135,7 +177,8 @@ def run_pipeline(
         "stage",
         stage="merge",
         title="Merge + snippet check",
-        activity="attaching facts to path classes",
+        activity="both explorers done — attaching facts to path classes",
+        detail=f"call_facts={len(call_pack.facts)} var_facts={len(var_pack.facts)}",
     )
     merged = merge_packs(prep, call_pack, var_pack, source)
     write_json(out / "03_merged.json", merged)

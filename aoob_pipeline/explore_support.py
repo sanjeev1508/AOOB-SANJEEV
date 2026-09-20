@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from aoob_pipeline.schemas import Fact, PrepPack
+from aoob_pipeline.schemas import ExplorePack, Fact, PrepPack
 from aoob_pipeline.source_index import SourceIndex
 
 _GUARD_RE = re.compile(
@@ -147,14 +147,78 @@ def call_path_sequence(prep: PrepPack) -> list[str]:
     return out
 
 
-def var_value_sequence(prep: PrepPack, source: SourceIndex, *, cap: int = 8) -> list[str]:
-    """Tight visit list: enclosing + value-origin callees + path callers + writers.
+def call_path_edges(prep: PrepPack) -> list[dict[str, str]]:
+    """Caller→callee edges for UI call-path highlighting."""
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for edge in prep.edges:
+        a = str(edge.get("caller") or "").strip()
+        b = str(edge.get("callee") or "").strip()
+        if not a or not b or (a, b) in seen:
+            continue
+        seen.add((a, b))
+        out.append({"s": a, "t": b})
+    if out:
+        return out
+    # Fallback: consecutive steps inside each path class
+    for cls in prep.path_classes:
+        names = [s.function for s in cls.sequence if s.function]
+        for i in range(len(names) - 1):
+            key = (names[i], names[i + 1])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"s": names[i], "t": names[i + 1]})
+    return out
 
-    Do NOT expand every ``used_in_functions`` hit for a shared parameter name —
-    that floods 7B explorers with unrelated siblings. Functions that *produce*
-    the index value (``idx = Fn(...)``) are visited even though Astree's call
-    stack never lists them — that is where the real bound usually lives.
+
+def dataflow_symbol_paths(prep: PrepPack) -> list[dict[str, Any]]:
+    """Per-symbol function chains for UI dataflow highlighting (all alarm symbols)."""
+    paths: list[dict[str, Any]] = []
+    for sym in prep.symbols:
+        name = (sym.symbol_name or "").strip()
+        if not name:
+            continue
+        funcs = [f for f in (sym.function_sequence or []) if f and f != "global"]
+        if not funcs and prep.enclosing_function:
+            funcs = [prep.enclosing_function]
+        edges: list[dict[str, str]] = []
+        for i in range(len(funcs) - 1):
+            edges.append({"s": funcs[i], "t": funcs[i + 1]})
+        paths.append(
+            {
+                "symbol": name,
+                "role": sym.role,
+                "kind": sym.kind,
+                "functions": funcs,
+                "edges": edges,
+                "declaration_line": sym.declaration_line,
+            }
+        )
+    return paths
+
+
+def var_value_sequence(prep: PrepPack, source: SourceIndex, *, cap: int | None = None) -> list[str]:
+    """Visit list covering EVERY dataflow symbol's functions + value origins.
+
+    Includes:
+    - enclosing function
+    - value-origin callees (``idx = Fn(...)``)
+    - each symbol's ``function_sequence`` / used_in (dataflow list)
+    - write / declaration enclosing functions
+    - full call-path sequence when index is not purely local
+
+    Cap defaults to ``AOOB_VAR_SEQUENCE_CAP`` (24) so large alarms stay bounded
+    but multi-symbol dataflow is not truncated to 8.
     """
+    import os
+
+    if cap is None:
+        try:
+            cap = max(8, int(os.getenv("AOOB_VAR_SEQUENCE_CAP") or 24))
+        except ValueError:
+            cap = 24
+
     seen: set[str] = set()
     out: list[str] = []
 
@@ -168,23 +232,109 @@ def var_value_sequence(prep: PrepPack, source: SourceIndex, *, cap: int = 8) -> 
     add(prep.enclosing_function)
     for name in prep.value_origin_callees:
         add(name)
+
+    # All symbols from the alarm dataflow list — declaration + used_in chains
+    for sym in prep.symbols:
+        for name in sym.function_sequence or []:
+            add(name)
+        for line in sym.write_lines:
+            try:
+                add(source.enclosing_function(int(line)))
+            except (TypeError, ValueError):
+                continue
+        if sym.declaration_line:
+            try:
+                add(source.enclosing_function(int(sym.declaration_line)))
+            except (TypeError, ValueError):
+                pass
+
     if prep.index_origin != "local":
-        # callers only matter when they can feed the index (parameter) or set
-        # shared state before the call (global); a purely local index skips them
         for name in call_path_sequence(prep):
             add(name)
 
-    for sym in prep.symbols:
-        for line in sym.write_lines:
-            try:
-                ln = int(line)
-            except (TypeError, ValueError):
-                continue
-            add(source.enclosing_function(ln))
-        if sym.declaration_line:
-            add(source.enclosing_function(int(sym.declaration_line)))
-
     return out[:cap]
+
+
+_COMPACT_KINDS_CALL = frozenset(
+    {"call_edge", "arg_binding", "alarm_site", "path_step", "declaration", "array_size_hint", "local_guard"}
+)
+_COMPACT_KINDS_VAR = frozenset(
+    {
+        "declaration",
+        "write",
+        "guard",
+        "clamp",
+        "mask",
+        "loop_bound",
+        "array_size_hint",
+        "alarm_site",
+        "arg_binding",
+        "local_guard",
+        "access",
+    }
+)
+_COMPACT_PRIORITY = {
+    "alarm_site": 0,
+    "array_size_hint": 1,
+    "local_guard": 2,
+    "declaration": 3,
+    "write": 4,
+    "guard": 5,
+    "clamp": 5,
+    "mask": 5,
+    "loop_bound": 5,
+    "arg_binding": 6,
+    "call_edge": 7,
+    "path_step": 8,
+    "access": 9,
+}
+
+
+def compact_explore_pack(
+    pack: ExplorePack,
+    *,
+    role: str,
+    max_facts: int | None = None,
+) -> ExplorePack:
+    """Keep only high-signal facts so TP/FP briefs stay inside context limits."""
+    import os
+
+    if max_facts is None:
+        try:
+            max_facts = max(12, int(os.getenv("AOOB_EXPLORE_MAX_FACTS") or 48))
+        except ValueError:
+            max_facts = 48
+    allow = _COMPACT_KINDS_CALL if role == "call_path" else _COMPACT_KINDS_VAR
+    ranked = sorted(
+        (f for f in pack.facts if f.kind in allow),
+        key=lambda f: (
+            0 if f.verified else 1,
+            _COMPACT_PRIORITY.get(f.kind, 20),
+            f.line,
+        ),
+    )
+    kept: list[Fact] = []
+    seen_key: set[tuple] = set()
+    seen_decl: set[str] = set()
+    for f in ranked:
+        key = (f.function, f.line, f.kind, (f.symbol or "")[:40])
+        if key in seen_key:
+            continue
+        if f.kind == "declaration" and f.symbol:
+            if f.symbol in seen_decl and len(kept) > max_facts // 2:
+                continue
+            seen_decl.add(f.symbol)
+        seen_key.add(key)
+        quote = f.quote[:160] if f.quote else f.quote
+        kept.append(f.model_copy(update={"quote": quote}))
+        if len(kept) >= max_facts:
+            break
+    notes = list(pack.notes)
+    if len(pack.facts) > len(kept):
+        notes.append(f"compacted facts {len(pack.facts)}→{len(kept)} for prover brief")
+    return ExplorePack(
+        agent=pack.agent, facts=kept, notes=notes, tool_trace=pack.tool_trace, error=pack.error
+    )
 
 
 _INIT_SCAN_LINES = 20000

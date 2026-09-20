@@ -190,6 +190,15 @@ export type CfgResponse = {
   edge_count: number;
 };
 
+export type AgentCursor = {
+  current?: string | null;
+  index?: number;
+  total?: number;
+  sequence?: string[];
+  symbols?: string[];
+  done?: boolean;
+};
+
 export type AgentFocus = {
   agent?: string;
   stage?: string;
@@ -197,6 +206,17 @@ export type AgentFocus = {
   functions?: string[];
   edges?: Array<{ s: string; t: string }>;
   updated_at?: number;
+  cursors?: Record<string, AgentCursor>;
+  call_path?: {
+    sequence?: string[];
+    edges?: Array<{ s: string; t: string }>;
+  };
+  var_paths?: Array<{
+    symbol?: string;
+    role?: string;
+    functions?: string[];
+    edges?: Array<{ s: string; t: string }>;
+  }>;
 };
 
 export type PipelineEvent = {

@@ -19,6 +19,10 @@ const C = {
   label: "#dce3f6",
   agent: "#ff7a59",
   agentEdge: "#ffb08a",
+  callPath: "#ff7a59",
+  callPathEdge: "#ff9a6e",
+  varPath: "#6ec8ff",
+  varPathEdge: "#4aa8e8",
 };
 
 const MAX_EXPAND = 40;
@@ -262,6 +266,53 @@ export default function FullGraph({
       });
     });
 
+    const callSeq = (agentFocus?.call_path?.sequence?.length
+      ? agentFocus.call_path.sequence
+      : agentFocus?.cursors?.CALL_PATH_EXPLORE?.sequence) ?? [];
+    const callNodes = new Set(
+      callSeq.map((name) => resolveNode(g, name)).filter((name): name is string => Boolean(name)),
+    );
+    const callEdgeKeys = new Set(
+      (agentFocus?.call_path?.edges?.length
+        ? agentFocus.call_path.edges
+        : callSeq.slice(0, -1).map((s, i) => ({ s, t: callSeq[i + 1] }))
+      )
+        .map((edge) => {
+          const from = resolveNode(g, edge.s);
+          const to = resolveNode(g, edge.t);
+          return from && to ? `${from}->${to}` : "";
+        })
+        .filter(Boolean),
+    );
+
+    const varEdgeKeys = new Set<string>();
+    const varNodes = new Set<string>();
+    for (const path of agentFocus?.var_paths ?? []) {
+      for (const name of path.functions ?? []) {
+        const resolved = resolveNode(g, name);
+        if (resolved) varNodes.add(resolved);
+      }
+      for (const edge of path.edges ?? []) {
+        const from = resolveNode(g, edge.s);
+        const to = resolveNode(g, edge.t);
+        if (from && to) varEdgeKeys.add(`${from}->${to}`);
+      }
+    }
+    // Also include the var explorer's current sequence as a soft path
+    const varSeq = agentFocus?.cursors?.VAR_VALUE_EXPLORE?.sequence ?? [];
+    for (let i = 0; i < varSeq.length; i += 1) {
+      const resolved = resolveNode(g, varSeq[i]);
+      if (resolved) varNodes.add(resolved);
+      if (i > 0) {
+        const from = resolveNode(g, varSeq[i - 1]);
+        const to = resolveNode(g, varSeq[i]);
+        if (from && to) varEdgeKeys.add(`${from}->${to}`);
+      }
+    }
+
+    const callCursor = resolveNode(g, agentFocus?.cursors?.CALL_PATH_EXPLORE?.current || "");
+    const varCursor = resolveNode(g, agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current || "");
+
     const agentNodes = new Set(
       (agentFocus?.functions ?? [])
         .map((name) => resolveNode(g, name))
@@ -282,8 +333,37 @@ export default function FullGraph({
       const onPath = seqSet.has(id);
       const isExpanded = expanded.has(id);
       const isCallee = calleeOf.has(id);
+      const isCallCursor = callCursor === id;
+      const isVarCursor = varCursor === id;
+      const onCallPath = callNodes.has(id);
+      const onVarPath = varNodes.has(id);
       const isAgent = agentNodes.has(id);
-      if (isAgent) {
+      if (isCallCursor && isVarCursor) {
+        // Both explorers parked on the same function — call color, oversized marker
+        g.setNodeAttribute(id, "color", C.callPath);
+        g.setNodeAttribute(id, "size", Math.max(16, base * 4.8));
+        g.setNodeAttribute(id, "label", id);
+        g.setNodeAttribute(id, "forceLabel", true);
+        g.setNodeAttribute(id, "zIndex", 7);
+      } else if (isCallCursor || isVarCursor) {
+        g.setNodeAttribute(id, "color", isCallCursor ? C.callPath : C.varPath);
+        g.setNodeAttribute(id, "size", Math.max(14, base * 4.2));
+        g.setNodeAttribute(id, "label", id);
+        g.setNodeAttribute(id, "forceLabel", true);
+        g.setNodeAttribute(id, "zIndex", 6);
+      } else if (onCallPath) {
+        g.setNodeAttribute(id, "color", C.callPath);
+        g.setNodeAttribute(id, "size", Math.max(9, base * 3));
+        g.setNodeAttribute(id, "label", id);
+        g.setNodeAttribute(id, "forceLabel", true);
+        g.setNodeAttribute(id, "zIndex", 5);
+      } else if (onVarPath) {
+        g.setNodeAttribute(id, "color", C.varPath);
+        g.setNodeAttribute(id, "size", Math.max(7, base * 2.4));
+        g.setNodeAttribute(id, "label", id);
+        g.setNodeAttribute(id, "forceLabel", true);
+        g.setNodeAttribute(id, "zIndex", 4);
+      } else if (isAgent) {
         g.setNodeAttribute(id, "color", C.agent);
         g.setNodeAttribute(id, "size", Math.max(10, base * 3.2));
         g.setNodeAttribute(id, "label", id);
@@ -309,20 +389,34 @@ export default function FullGraph({
         g.setNodeAttribute(id, "forceLabel", true);
         g.setNodeAttribute(id, "zIndex", 2);
       } else {
-        g.setNodeAttribute(id, "color", active || agentNodes.size ? C.dim : C.base);
-        g.setNodeAttribute(id, "size", active || agentNodes.size ? Math.max(0.8, base * 0.35) : base);
-        g.setNodeAttribute(id, "label", showAllLabels || !active ? id : "");
+        const busy = active || agentNodes.size || callNodes.size || varNodes.size;
+        g.setNodeAttribute(id, "color", busy ? C.dim : C.base);
+        g.setNodeAttribute(id, "size", busy ? Math.max(0.8, base * 0.35) : base);
+        g.setNodeAttribute(id, "label", showAllLabels || !busy ? id : "");
         g.setNodeAttribute(id, "forceLabel", showAllLabels);
         g.setNodeAttribute(id, "zIndex", 0);
       }
     });
 
     g.forEachEdge((id, attrs, source, target) => {
-      const onPath = pathEdges.has(id) || pathEdges.has(`${source}->${target}`);
-      const isExpand = expandEdges.has(id) || expandEdges.has(`${source}->${target}`);
-      const isAgent = agentEdgeKeys.has(`${source}->${target}`) || agentEdgeKeys.has(id);
-      const visible = showEdges || onPath || isExpand || isAgent;
-      if (isAgent) {
+      const key = `${source}->${target}`;
+      const onPath = pathEdges.has(id) || pathEdges.has(key);
+      const isExpand = expandEdges.has(id) || expandEdges.has(key);
+      const isCall = callEdgeKeys.has(key) || callEdgeKeys.has(id);
+      const isVar = varEdgeKeys.has(key) || varEdgeKeys.has(id);
+      const isAgent = agentEdgeKeys.has(key) || agentEdgeKeys.has(id);
+      const visible = showEdges || onPath || isExpand || isAgent || isCall || isVar;
+      if (isCall) {
+        g.setEdgeAttribute(id, "hidden", false);
+        g.setEdgeAttribute(id, "color", C.callPathEdge);
+        g.setEdgeAttribute(id, "size", (Number(attrs.originalSize) || 1) * 5.2);
+        g.setEdgeAttribute(id, "zIndex", 5);
+      } else if (isVar) {
+        g.setEdgeAttribute(id, "hidden", false);
+        g.setEdgeAttribute(id, "color", C.varPathEdge);
+        g.setEdgeAttribute(id, "size", (Number(attrs.originalSize) || 1) * 2.4);
+        g.setEdgeAttribute(id, "zIndex", 4);
+      } else if (isAgent) {
         g.setEdgeAttribute(id, "hidden", false);
         g.setEdgeAttribute(id, "color", C.agentEdge);
         g.setEdgeAttribute(id, "size", (Number(attrs.originalSize) || 1) * 3.6);
@@ -338,48 +432,23 @@ export default function FullGraph({
         g.setEdgeAttribute(id, "size", (Number(attrs.originalSize) || 1) * 2.4);
         g.setEdgeAttribute(id, "zIndex", 1);
       } else {
+        const busy = active || agentNodes.size || callNodes.size || varNodes.size;
         g.setEdgeAttribute(id, "hidden", !visible);
-        g.setEdgeAttribute(id, "color", active || agentNodes.size ? "#152033" : C.edge);
-        g.setEdgeAttribute(id, "size", active || agentNodes.size ? Math.max(0.2, Number(attrs.originalSize) * 0.35) : attrs.originalSize);
+        g.setEdgeAttribute(id, "color", busy ? "#152033" : C.edge);
+        g.setEdgeAttribute(id, "size", busy ? Math.max(0.2, Number(attrs.originalSize) * 0.35) : attrs.originalSize);
         g.setEdgeAttribute(id, "zIndex", 0);
       }
     });
 
-    renderer.setSetting("labelRenderedSizeThreshold", showAllLabels || active || expanded.size || agentNodes.size ? 0 : 6);
+    renderer.setSetting(
+      "labelRenderedSizeThreshold",
+      showAllLabels || active || expanded.size || agentNodes.size || callNodes.size || varNodes.size ? 0 : 6,
+    );
     renderer.refresh();
   }, [agentFocus, expanded, graph, highlight, sequence, sequences, showAllLabels, showEdges]);
 
-  useEffect(() => {
-    const renderer = sigmaRef.current;
-    const g = graphRef.current;
-    if (!renderer || !g) return;
-    const agentNames = (agentFocus?.functions ?? [])
-      .map((name) => resolveNode(g, name))
-      .filter((name): name is string => Boolean(name));
-    const callees = [...expanded].flatMap((name) => (g.hasNode(name) ? g.outNeighbors(name).slice(0, MAX_EXPAND) : []));
-    const focus = (agentNames.length ? agentNames : expanded.size ? [...expanded, ...callees] : sequence)
-      .filter((id, index, all) => all.indexOf(id) === index && g.hasNode(id));
-    if (!focus.length) {
-      if (!highlight?.center && !agentFocus?.functions?.length) renderer.getCamera().animatedReset({ duration: 400 });
-      return;
-    }
-    const points = focus
-      .map((id) => renderer.getNodeDisplayData(id))
-      .filter((point): point is NonNullable<typeof point> => Boolean(point));
-    if (!points.length) return;
-    const xs = points.map((point) => point.x);
-    const ys = points.map((point) => point.y);
-    renderer.getCamera().animate(
-      {
-        ...renderer.getCamera().getState(),
-        angle: 0,
-        x: (Math.min(...xs) + Math.max(...xs)) / 2,
-        y: (Math.min(...ys) + Math.max(...ys)) / 2,
-        ratio: focus.length === 1 ? 0.08 : agentNames.length ? 0.18 : expanded.size ? 0.28 : 0.22,
-      },
-      { duration: 280 },
-    );
-  }, [agentFocus, expanded, graph, highlight, sequence]);
+  // No auto-zoom on agent focus / path changes — keep the full graph view stable.
+  // Manual Fit / Zoom to path buttons remain available.
 
   const fit = () => {
     sigmaRef.current?.getCamera().animatedReset({ duration: 400 });
@@ -425,15 +494,48 @@ export default function FullGraph({
     <div className="pver-graph-layout">
       <div className="full-graph">
         <div ref={hostRef} className="sigma-host" />
-        {agentFocus?.agent || agentFocus?.activity ? (
+        {agentFocus?.agent || agentFocus?.activity || agentFocus?.cursors ? (
           <div className="agent-live-banner">
-            <strong>{agentFocus.agent || agentFocus.stage || "pipeline"}</strong>
-            <span>{agentFocus.activity || "working"}</span>
-            {agentFocus.functions?.length ? (
-              <em>{agentFocus.functions.slice(0, 4).join(" · ")}{agentFocus.functions.length > 4 ? "…" : ""}</em>
+            <strong>{agentFocus?.agent || agentFocus?.stage || "pipeline"}</strong>
+            <span>{agentFocus?.activity || "working"}</span>
+            {agentFocus?.cursors?.CALL_PATH_EXPLORE?.current ? (
+              <em className="cursor-call">
+                call@{agentFocus.cursors.CALL_PATH_EXPLORE.current}
+                {agentFocus.cursors.CALL_PATH_EXPLORE.index
+                  ? ` (${agentFocus.cursors.CALL_PATH_EXPLORE.index}/${agentFocus.cursors.CALL_PATH_EXPLORE.total || "?"})`
+                  : ""}
+              </em>
+            ) : null}
+            {agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current ? (
+              <em className="cursor-var">
+                var@{agentFocus.cursors.VAR_VALUE_EXPLORE.current}
+                {agentFocus.cursors.VAR_VALUE_EXPLORE.symbols?.length
+                  ? ` · ${agentFocus.cursors.VAR_VALUE_EXPLORE.symbols.slice(0, 4).join(",")}`
+                  : ""}
+              </em>
             ) : null}
           </div>
         ) : null}
+        <div className="agent-cursor-stack">
+          {agentFocus?.cursors?.CALL_PATH_EXPLORE?.current ? (
+            <div className="agent-cursor-chip call">
+              <span className="chip-tag">CALL_PATH</span>
+              <span className="chip-fn">{agentFocus.cursors.CALL_PATH_EXPLORE.current}</span>
+              <span className="chip-meta">
+                {agentFocus.cursors.CALL_PATH_EXPLORE.index}/{agentFocus.cursors.CALL_PATH_EXPLORE.total || "?"}
+              </span>
+            </div>
+          ) : null}
+          {agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current ? (
+            <div className="agent-cursor-chip var">
+              <span className="chip-tag">VAR_VALUE</span>
+              <span className="chip-fn">{agentFocus.cursors.VAR_VALUE_EXPLORE.current}</span>
+              <span className="chip-meta">
+                {(agentFocus.cursors.VAR_VALUE_EXPLORE.symbols || []).slice(0, 3).join(", ") || "symbols"}
+              </span>
+            </div>
+          ) : null}
+        </div>
         <div className="graph-filters">
           <label>
             <input type="checkbox" checked={showAllLabels} onChange={(event) => setShowAllLabels(event.target.checked)} />
@@ -459,6 +561,8 @@ export default function FullGraph({
           <span><i className="swatch expand" /> expanded</span>
           <span><i className="swatch callee" /> callee</span>
           <span><i className="swatch agent" /> agent focus</span>
+          <span><i className="swatch call-path" /> call_path (thick)</span>
+          <span><i className="swatch var-path" /> var/dataflow (soft)</span>
           <span>{graph.file || "full_control_flow_graph.json"} · {graph.stats?.nodes ?? graph.function_count} nodes · {graph.stats?.edges ?? graph.cf_edge_count} edges</span>
           {sequences.length ? (
             <span>{sequences.length} unique paths · {sequence.length} nodes</span>

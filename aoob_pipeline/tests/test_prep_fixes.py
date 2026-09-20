@@ -11,6 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from aoob_pipeline.explore_support import (
+    compact_explore_pack,
+    dataflow_symbol_paths,
     mine_facts_from_body,
     normalize_llm_fact,
     relevance_tokens,
@@ -202,7 +204,11 @@ def test_local_origin_keeps_coverage_full_when_capped(tmp_path: Path) -> None:
     assert prep.coverage_cap == "full"
     assert any("computed locally" in n for n in prep.notes)
     # callers are irrelevant for a local index → not in the VAR sequence
-    assert var_value_sequence(prep, source) == ["LocalIdx", "TableSize"]
+    seq = var_value_sequence(prep, source)
+    assert seq[0] == "LocalIdx"
+    assert "TableSize" in seq
+    assert "Caller1" not in seq and "Caller4" not in seq
+    # Leaf may appear via the symbol's used_in / function_sequence (dataflow)
 
 
 def test_mining_does_not_treat_declaration_as_access(tmp_path: Path) -> None:
@@ -303,3 +309,35 @@ def test_validate_local_origin_addresses_all_classes(tmp_path: Path) -> None:
                      findings=[{"function": "LocalIdx", "line": alarm_line, "quote": "if (tbl[posn] == did)"}])
     validated: ValidatedReports = validate_reports(merged, ProveReport(agent="TP_PROVE", rationale="none"), fp, source)
     assert validated.fp.unaddressed_path_classes == []
+
+
+def test_multi_symbol_var_sequence_and_compact_pack(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    prep = build_prep(pver_id="t", order="7", alarm=_alarm(), source=source)
+    names = {s.symbol_name for s in prep.symbols}
+    assert "tbl" in names and "numClass" in names
+
+    paths = dataflow_symbol_paths(prep)
+    assert {p["symbol"] for p in paths} >= {"tbl", "numClass"}
+    for p in paths:
+        assert p["functions"], f"symbol {p['symbol']} needs a function chain"
+
+    seq = var_value_sequence(prep, source)
+    # Every dataflow symbol's used_in / declaration function appears
+    for p in paths:
+        for fn in p["functions"]:
+            assert fn in seq, f"{fn} missing from var sequence for {p['symbol']}"
+
+    seeds = seed_facts(prep, source)
+    # Noise facts that compact should drop for call_path role
+    noise = [
+        Fact(kind="access", function="Leaf", line=1, quote="x", symbol="tbl"),
+        Fact(kind="write", function="Leaf", line=2, quote="y", symbol="numClass"),
+        *seeds,
+        *seeds,  # duplicates
+    ]
+    pack = ExplorePack(agent="CALL_PATH_EXPLORE", facts=noise)
+    compact = compact_explore_pack(pack, role="call_path", max_facts=8)
+    assert len(compact.facts) <= 8
+    assert all(f.kind != "access" for f in compact.facts)  # access not in call allowlist
+    assert any(f.kind == "declaration" for f in compact.facts)

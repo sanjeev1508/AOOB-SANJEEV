@@ -42,6 +42,9 @@ class EventBus:
         functions: list[str] | None = None,
         edges: list[dict[str, str]] | None = None,
         activity: str | None = None,
+        cursor: dict[str, Any] | None = None,
+        call_path: dict[str, Any] | None = None,
+        var_paths: list[dict[str, Any]] | None = None,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         event: dict[str, Any] = {
@@ -58,11 +61,26 @@ class EventBus:
             "edges": edges or [],
             "activity": activity,
         }
+        if cursor is not None:
+            event["cursor"] = cursor
+        if call_path is not None:
+            event["call_path"] = call_path
+        if var_paths is not None:
+            event["var_paths"] = var_paths
         if extra:
             event["extra"] = extra
         with self._lock:
             self._events.append(event)
-            if functions is not None or edges is not None or activity is not None or agent is not None:
+            touch = (
+                functions is not None
+                or edges is not None
+                or activity is not None
+                or agent is not None
+                or cursor is not None
+                or call_path is not None
+                or var_paths is not None
+            )
+            if touch:
                 if agent is not None:
                     self._focus["agent"] = agent
                 if activity is not None:
@@ -71,6 +89,14 @@ class EventBus:
                     self._focus["functions"] = list(functions)
                 if edges is not None:
                     self._focus["edges"] = list(edges)
+                if call_path is not None:
+                    self._focus["call_path"] = dict(call_path)
+                if var_paths is not None:
+                    self._focus["var_paths"] = list(var_paths)
+                if cursor is not None and agent:
+                    cursors = dict(self._focus.get("cursors") or {})
+                    cursors[agent] = dict(cursor)
+                    self._focus["cursors"] = cursors
                 self._focus["stage"] = stage or self._focus.get("stage")
                 self._focus["updated_at"] = event["ts"]
             focus = dict(self._focus)

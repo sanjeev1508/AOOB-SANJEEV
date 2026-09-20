@@ -61,10 +61,12 @@ button { cursor: pointer; }
 .graph-legend .swatch.expand { background: #49d9ad; }
 .graph-legend .swatch.callee { background: #c9a0ff; }
 .graph-legend .swatch.agent { background: #ff7a59; box-shadow: 0 0 8px #ff7a5988; }
+.graph-legend .swatch.call-path { background: #ff9a6e; box-shadow: 0 0 6px #ff9a6e88; }
+.graph-legend .swatch.var-path { background: #4aa8e8; box-shadow: 0 0 6px #4aa8e888; }
 .agent-live-banner {
   position: absolute; top: 14px; left: 14px; z-index: 5;
-  max-width: min(520px, 70%);
-  display: flex; flex-direction: column; gap: 4px;
+  max-width: min(640px, 72%);
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   padding: 10px 12px; border-radius: 10px;
   background: rgba(18, 10, 8, 0.88); border: 1px solid #ff7a5988;
   color: #ffe6dc; font-size: 11px; line-height: 1.35;
@@ -72,6 +74,29 @@ button { cursor: pointer; }
 }
 .agent-live-banner strong { color: #ff7a59; letter-spacing: .04em; text-transform: uppercase; font-size: 10px; }
 .agent-live-banner em { color: #9eb0d4; font-style: normal; font-family: "JetBrains Mono", Consolas, monospace; font-size: 10px; }
+.agent-live-banner em.cursor-call { color: #ff9a6e; }
+.agent-live-banner em.cursor-var { color: #6ec8ff; }
+.agent-cursor-stack {
+  position: absolute; top: 68px; left: 14px; z-index: 5;
+  display: flex; flex-direction: column; gap: 8px; pointer-events: none;
+}
+.agent-cursor-chip {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: 999px;
+  background: #0d1526f0; border: 1px solid #33466c;
+  font-family: "JetBrains Mono", Consolas, monospace; font-size: 11px;
+  box-shadow: 0 6px 18px #00000055;
+}
+.agent-cursor-chip.call { border-color: #ff9a6e88; }
+.agent-cursor-chip.var { border-color: #4aa8e888; }
+.agent-cursor-chip .chip-tag {
+  font-size: 9px; letter-spacing: .06em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 999px; background: #1a2740; color: #9eb0d4;
+}
+.agent-cursor-chip.call .chip-tag { color: #ff9a6e; background: #3a2218; }
+.agent-cursor-chip.var .chip-tag { color: #6ec8ff; background: #132a3a; }
+.agent-cursor-chip .chip-fn { color: #e8eefc; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-cursor-chip .chip-meta { color: #7f90b2; font-size: 10px; }
 .chat-bubble.event { background: #101827; border-color: #2a3a5c; }
 .chat-bubble.event.agent_input { border-left: 3px solid #5b8def; }
 .chat-bubble.event.agent_thinking { border-left: 3px solid #ffc93c; }

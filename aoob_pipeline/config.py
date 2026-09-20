@@ -123,7 +123,7 @@ def pipeline_config(root: Path | None = None) -> PipelineConfig:
         max_reexplore=int(os.getenv("AOOB_MAX_REEXPLORE") or 1),
         ollama_fallback=(os.getenv("AOOB_OLLAMA_RUNTIME_FALLBACK") or "1").strip() not in {"0", "false", "no"},
         tp_policy=(os.getenv("AOOB_TP_POLICY") or "type_legal").strip().lower(),
-        prover_brief_max_chars=int(os.getenv("AOOB_PROVER_BRIEF_MAX_CHARS") or 60000),
+        prover_brief_max_chars=int(os.getenv("AOOB_PROVER_BRIEF_MAX_CHARS") or 40000),
         final_temperatures=_parse_temps(os.getenv("AOOB_FINAL_TEMPERATURES")),
     )
 

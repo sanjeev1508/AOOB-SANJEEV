@@ -14,7 +14,10 @@ from langgraph.prebuilt import ToolNode
 from aoob_pipeline import prompts
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.explore_support import (
+    call_path_edges,
     call_path_sequence,
+    compact_explore_pack,
+    dataflow_symbol_paths,
     force_open_bodies,
     mine_facts_from_body,
     normalize_llm_fact,
@@ -61,7 +64,7 @@ def _prep_brief(
         "visit_instructions": (
             [
                 "Functions are opened for you one at a time (no tools).",
-                "For each body, return ONLY facts about the index/array symbols.",
+                "For each body, return ONLY facts about the listed symbols (ALL of them for var_value).",
             ]
             if code_driven
             else [
@@ -86,6 +89,11 @@ def _prep_brief(
     }
     if role == "var_value":
         payload["symbols"] = [s.model_dump() for s in prep.symbols]
+        payload["symbol_paths"] = dataflow_symbol_paths(prep)
+        payload["extract_rule"] = (
+            "For EVERY symbol in symbols[], record declaration + writes/guards/size "
+            "when present in the opened bodies. Tag each fact.symbol explicitly."
+        )
     return payload
 
 
@@ -107,6 +115,28 @@ def _tool_focus(name: str, args: dict[str, Any], cursor: ExploreCursor) -> tuple
     return ([], f"tool {name}")
 
 
+def _cursor_payload(
+    cursor: ExploreCursor,
+    *,
+    role: Literal["call_path", "var_value"],
+    symbols: list[str],
+    done: bool = False,
+) -> dict[str, Any]:
+    seq = list(cursor.sequence)
+    cur = cursor.current()
+    idx = cursor.index + 1 if cur else len(cursor.opened)
+    payload: dict[str, Any] = {
+        "current": cur,
+        "index": idx,
+        "total": len(seq),
+        "sequence": seq,
+        "done": done,
+    }
+    if role == "var_value":
+        payload["symbols"] = symbols
+    return payload
+
+
 def _build_explore_graph(
     llm: Any,
     tools: list,
@@ -116,12 +146,15 @@ def _build_explore_graph(
     *,
     agent: str,
     bus: EventBus | None,
+    role: Literal["call_path", "var_value"] = "call_path",
+    symbols: list[str] | None = None,
 ):
     # Prefer requiring a tool call while exploration is incomplete.
     try:
         bound = llm.bind_tools(tools, tool_choice="any")
     except TypeError:
         bound = llm.bind_tools(tools)
+    sym_names = list(symbols or [])
 
     def agent_node(state: ExploreState) -> dict:
         if sink.get("pack") is not None:
@@ -134,6 +167,7 @@ def _build_explore_graph(
                 title=f"{agent} reasoning",
                 activity="planning next move/get/submit",
                 functions=[cursor.current()] if cursor.current() else cursor.remaining()[:5],
+                cursor=_cursor_payload(cursor, role=role, symbols=sym_names),
             )
         response = bound.invoke(state["messages"])
         idle = int(state.get("idle_turns", 0))
@@ -153,6 +187,7 @@ def _build_explore_graph(
                         detail=preview_json(args, 800),
                         functions=funcs,
                         activity=activity,
+                        cursor=_cursor_payload(cursor, role=role, symbols=sym_names),
                     )
         else:
             idle += 1
@@ -201,6 +236,7 @@ def _build_explore_graph(
                     output_preview=content[:1200],
                     functions=funcs,
                     activity=f"got result from {name}",
+                    cursor=_cursor_payload(cursor, role=role, symbols=sym_names),
                 )
         return {
             **result,
@@ -347,6 +383,11 @@ def _run_explore_code_driven(
     brief = _prep_brief(prep, role, sequence, code_driven=True)
     if focus:
         brief["reexplore_focus"] = focus
+    seq_edges = [
+        {"s": sequence[i], "t": sequence[i + 1]}
+        for i in range(len(sequence) - 1)
+    ]
+    symbol_paths = dataflow_symbol_paths(prep) if role == "var_value" else []
     if bus:
         bus.emit(
             "agent_input",
@@ -355,7 +396,21 @@ def _run_explore_code_driven(
             title=f"Input → {agent} (code-driven)",
             input_preview=preview_json(brief),
             functions=sequence,
+            edges=seq_edges,
             activity=f"code opens {len(sequence)} funcs; LLM extracts only",
+            cursor={
+                "current": sequence[0] if sequence else None,
+                "index": 1 if sequence else 0,
+                "total": len(sequence),
+                "sequence": sequence,
+                "symbols": [s.symbol_name for s in prep.symbols] if role == "var_value" else [],
+            },
+            call_path=(
+                {"sequence": sequence, "edges": seq_edges}
+                if role == "call_path"
+                else None
+            ),
+            var_paths=symbol_paths if role == "var_value" else None,
         )
 
     extract_system = prompts.code_driven_extract_prompt(role)
@@ -365,20 +420,27 @@ def _run_explore_code_driven(
     notes = ["explore_mode=code_driven"]
     dropped_llm = 0
 
-    for name in sequence:
+    for step_i, name in enumerate(sequence, start=1):
         body = source.get_func(name, near_line=prep.alarm_line if name == prep.enclosing_function else None)
         opened.append(name)
         if bus:
-            preview = str(body.get("snippet") or body.get("error") or "")
             bus.emit(
                 "tool_result",
                 agent=agent,
                 stage="explore",
                 title=f"{agent} ← get_func({name})",
                 tool="get_func",
-                output_preview=preview[:1200],
+                output_preview=str(body.get("snippet") or body.get("error") or "")[:1200],
                 functions=[name],
-                activity=f"opened {name}",
+                edges=seq_edges,
+                activity=f"opened {name} ({step_i}/{len(sequence)})",
+                cursor={
+                    "current": name,
+                    "index": step_i,
+                    "total": len(sequence),
+                    "sequence": sequence,
+                    "symbols": [s.symbol_name for s in prep.symbols] if role == "var_value" else [],
+                },
             )
         mined = mine_facts_from_body(agent=agent, function=name, body=body, prep=prep)
         for f in mined:
@@ -399,6 +461,13 @@ def _run_explore_code_driven(
                 title=f"{agent} extract @ {name}",
                 activity="JSON fact extract on pseudocode+cite (no tools)",
                 functions=[name],
+                cursor={
+                    "current": name,
+                    "index": step_i,
+                    "total": len(sequence),
+                    "sequence": sequence,
+                    "symbols": [s.symbol_name for s in prep.symbols] if role == "var_value" else [],
+                },
             )
             ratio = enriched.get("compress_ratio")
             bus.emit(
@@ -415,11 +484,13 @@ def _run_explore_code_driven(
                     + (f" ({ratio})" if ratio is not None else "")
                 ),
             )
+        sym_names = [s.symbol_name for s in prep.symbols if s.symbol_name]
         human = (
             f"function={name}\nrole={role}\n"
             f"index_expression={prep.index_expression}\n"
             f"index_tokens={sorted(t for t in relevant if t != prep.array_name and t not in sequence)}\n"
             f"array={prep.array_name}\narray_size={prep.array_size}\n"
+            f"symbols={sym_names}\n"
             f"alarm_line={prep.alarm_line}\n"
             f"BODY (PSEUDO for logic; CITE for exact quotes):\n{llm_view[:16000]}"
         )
@@ -453,10 +524,13 @@ def _run_explore_code_driven(
         seen.add(key)
         deduped.append(f)
 
-    pack = ExplorePack(
-        agent=agent,
-        facts=deduped,
-        notes=[*notes, f"opened={opened}", f"seeded {len(seeds)} deterministic facts"],
+    pack = compact_explore_pack(
+        ExplorePack(
+            agent=agent,
+            facts=deduped,
+            notes=[*notes, f"opened={opened}", f"seeded {len(seeds)} deterministic facts"],
+        ),
+        role=role,
     )
     if bus:
         bus.emit(
@@ -464,9 +538,25 @@ def _run_explore_code_driven(
             agent=agent,
             stage="explore",
             title=f"Output ← {agent}",
-            output_preview=preview_json(pack.model_dump()),
+            output_preview=preview_json(
+                {
+                    "agent": pack.agent,
+                    "fact_count": len(pack.facts),
+                    "facts": [f.model_dump() for f in pack.facts[:20]],
+                    "notes": pack.notes,
+                }
+            ),
             functions=opened,
-            activity=f"produced {len(deduped)} facts (code-driven)",
+            edges=seq_edges,
+            activity=f"produced {len(pack.facts)} facts (code-driven, compacted)",
+            cursor={
+                "current": opened[-1] if opened else None,
+                "index": len(opened),
+                "total": len(sequence),
+                "sequence": sequence,
+                "done": True,
+                "symbols": [s.symbol_name for s in prep.symbols] if role == "var_value" else [],
+            },
         )
     return pack
 
@@ -507,6 +597,12 @@ def _run_explore(
     if focus:
         brief["reexplore_focus"] = focus
 
+    sym_names = [s.symbol_name for s in prep.symbols if s.symbol_name]
+    seq_edges = [
+        {"s": sequence[i], "t": sequence[i + 1]}
+        for i in range(len(sequence) - 1)
+    ]
+    symbol_paths = dataflow_symbol_paths(prep) if role == "var_value" else []
     if bus:
         bus.emit(
             "agent_input",
@@ -516,20 +612,42 @@ def _run_explore(
             input_preview=preview_json(brief),
             functions=sequence,
             activity=f"sequence n={len(sequence)}; tool-agent mode",
-            edges=[
+            edges=seq_edges
+            or [
                 {"s": str(e.get("caller")), "t": str(e.get("callee"))}
                 for e in prep.edges[:30]
                 if e.get("caller") and e.get("callee")
             ],
+            cursor={
+                "current": sequence[0] if sequence else None,
+                "index": 1 if sequence else 0,
+                "total": len(sequence),
+                "sequence": sequence,
+                "symbols": sym_names if role == "var_value" else [],
+            },
+            call_path=(
+                {"sequence": sequence, "edges": seq_edges}
+                if role == "call_path"
+                else None
+            ),
+            var_paths=symbol_paths if role == "var_value" else None,
         )
 
     cursor = ExploreCursor(sequence=list(sequence))
-    focus = relevance_tokens(prep, sequence)
-    tools, sink = make_explore_tools(source, cursor, focus_tokens=focus)
+    relevant = relevance_tokens(prep, sequence)
+    tools, sink = make_explore_tools(source, cursor, focus_tokens=relevant)
     llm = build_agent_llm(agent)
     rounds = max(max_rounds, max(8, len(sequence) * 3 + 4))
     graph = _build_explore_graph(
-        llm, tools, sink, cursor, max_rounds=rounds, agent=agent, bus=bus
+        llm,
+        tools,
+        sink,
+        cursor,
+        max_rounds=rounds,
+        agent=agent,
+        bus=bus,
+        role=role,
+        symbols=sym_names,
     )
 
     start_msg = (
@@ -582,7 +700,7 @@ def _run_explore(
             bus=bus,
         )
 
-    pack = _pack_from_sink(agent, sink, seeds)
+    pack = compact_explore_pack(_pack_from_sink(agent, sink, seeds), role=role)
     if bus:
         bus.emit(
             "agent_output",
@@ -592,6 +710,9 @@ def _run_explore(
             output_preview=preview_json(pack.model_dump()),
             functions=[f.function for f in pack.facts if f.function],
             activity=f"produced {len(pack.facts)} facts; opened={sorted(cursor.opened)}",
+            cursor=_cursor_payload(
+                cursor, role=role, symbols=sym_names, done=True
+            ),
         )
     return pack
 
@@ -616,11 +737,25 @@ def run_call_path_explore(
                 output_preview=preview_json([f.model_dump() for f in seeds]),
                 functions=sequence,
                 activity="local guard present — seed facts only",
+                cursor={
+                    "current": sequence[0] if sequence else None,
+                    "index": 1 if sequence else 0,
+                    "total": len(sequence),
+                    "sequence": sequence,
+                    "done": True,
+                },
+                call_path={
+                    "sequence": sequence,
+                    "edges": call_path_edges(prep),
+                },
             )
-        return ExplorePack(
-            agent="CALL_PATH_EXPLORE",
-            facts=seeds,
-            notes=["local guard short-circuit; sequence tools skipped"],
+        return compact_explore_pack(
+            ExplorePack(
+                agent="CALL_PATH_EXPLORE",
+                facts=seeds,
+                notes=["local guard short-circuit; sequence tools skipped"],
+            ),
+            role="call_path",
         )
     return _run_explore(
         agent="CALL_PATH_EXPLORE",
