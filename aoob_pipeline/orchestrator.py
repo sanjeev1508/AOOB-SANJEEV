@@ -10,14 +10,12 @@ from typing import Any, Callable
 from aoob_pipeline.artifacts import run_dir, write_json
 from aoob_pipeline.config import pipeline_config
 from aoob_pipeline.events import EventBus, preview_json
-from aoob_pipeline.explore_graph import run_call_path_explore, run_var_value_explore
+from aoob_pipeline.explore_graph import run_call_path_explore
 from aoob_pipeline.explore_support import (
-    build_symbol_package,
     call_path_edges,
     call_path_sequence,
     compact_explore_pack,
     dataflow_symbol_paths,
-    var_value_sequence,
 )
 from aoob_pipeline.final_graph import run_final_classification
 from aoob_pipeline.merge import merge_packs
@@ -107,19 +105,18 @@ def run_pipeline(
 
     explore_mode = (os.getenv("AOOB_EXPLORE_MODE") or "code_driven").strip().lower()
     cp_seq = call_path_sequence(prep)
-    vv_seq = var_value_sequence(prep, source)
     cp_edges = call_path_edges(prep)
     sym_paths = dataflow_symbol_paths(prep)
     bus.emit(
         "stage",
         stage="explore",
-        title="Explorers starting",
+        title="CALL_PATH_EXPLORE starting",
         detail=(
-            "CALL_PATH_EXPLORE + VAR_VALUE_EXPLORE "
-            + ("(code-driven: Python opens bodies, LLM extracts)" if explore_mode.startswith("code") else "(LangGraph + tools)")
-            + " — both must finish before merge/prove"
+            "Primary explorer walks the call path and tracks symbol values. "
+            "VAR_VALUE_EXPLORE runs on-demand only for unclear symbols. "
+            + ("(code-driven)" if explore_mode.startswith("code") else "(tool-agent)")
         ),
-        activity="explore fan-out",
+        activity="call_path primary",
         functions=cp_seq,
         edges=cp_edges,
         call_path={"sequence": cp_seq, "edges": cp_edges},
@@ -132,50 +129,11 @@ def run_pipeline(
         },
         agent="CALL_PATH_EXPLORE",
     )
-    # Seed VAR cursor at first symbol's primary function
-    first_sym = prep.symbols[0].symbol_name if prep.symbols else None
-    first_var_fn = None
-    if prep.symbols:
-        pkg0 = build_symbol_package(prep.symbols[0], prep, source, radius=3)
-        first_var_fn = pkg0.get("primary_function") or (vv_seq[0] if vv_seq else None)
-    bus.emit(
-        "stage",
-        stage="explore",
-        title="VAR_VALUE track ready (symbol-by-symbol)",
-        activity=f"symbols={[s.symbol_name for s in prep.symbols]}",
-        functions=[first_var_fn] if first_var_fn else [],
-        agent="VAR_VALUE_EXPLORE",
-        var_paths=sym_paths,
-        cursor={
-            "current": first_var_fn,
-            "prev": None,
-            "index": 1 if prep.symbols else 0,
-            "total": len(prep.symbols),
-            "sequence": [p.get("primary") for p in sym_paths if p.get("primary")],
-            "symbols": [s.symbol_name for s in prep.symbols],
-            "current_symbol": first_sym,
-        },
+
+    call_pack, var_pack = run_call_path_explore(
+        prep, source, max_rounds=cfg.max_tool_rounds, bus=bus
     )
 
-    if parallel_explore:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_cp = pool.submit(
-                run_call_path_explore, prep, source, max_rounds=cfg.max_tool_rounds, bus=bus
-            )
-            fut_vv = pool.submit(
-                run_var_value_explore, prep, source, max_rounds=cfg.max_tool_rounds, bus=bus
-            )
-            call_pack = fut_cp.result()
-            var_pack = fut_vv.result()
-    else:
-        call_pack = run_call_path_explore(
-            prep, source, max_rounds=cfg.max_tool_rounds, bus=bus
-        )
-        var_pack = run_var_value_explore(
-            prep, source, max_rounds=cfg.max_tool_rounds, bus=bus
-        )
-
-    # Both explorers finished — compact again then merge (never prove with only one side)
     call_pack = compact_explore_pack(call_pack, role="call_path")
     var_pack = compact_explore_pack(var_pack, role="var_value")
     write_json(out / "02_call_path_explore.json", call_pack)
@@ -199,29 +157,41 @@ def run_pipeline(
         edges=cp_edges,
         call_path={"sequence": cp_seq, "edges": cp_edges},
     )
-    bus.emit(
-        "agent_output",
-        agent="VAR_VALUE_EXPLORE",
-        stage="explore",
-        title="VAR_VALUE_EXPLORE done — returned this output",
-        output_preview=preview_json(
-            {
-                "agent": var_pack.agent,
-                "fact_count": len(var_pack.facts),
-                "facts": [f.model_dump() for f in var_pack.facts[:24]],
-                "notes": var_pack.notes,
-            }
-        ),
-        activity=f"done · {len(var_pack.facts)} facts",
-        functions=[p.get("primary") for p in sym_paths if p.get("primary")],
-        var_paths=sym_paths,
-    )
+    if var_pack.facts or any("on_demand" in n for n in var_pack.notes):
+        bus.emit(
+            "agent_output",
+            agent="VAR_VALUE_EXPLORE",
+            stage="explore",
+            title="VAR_VALUE_EXPLORE done — returned to CALL_PATH",
+            output_preview=preview_json(
+                {
+                    "agent": var_pack.agent,
+                    "fact_count": len(var_pack.facts),
+                    "facts": [f.model_dump() for f in var_pack.facts[:24]],
+                    "notes": var_pack.notes,
+                }
+            ),
+            activity=f"done · {len(var_pack.facts)} on-demand facts",
+            var_paths=sym_paths,
+            var_focus={
+                "status": "done",
+                "symbols": sorted({f.symbol for f in var_pack.facts if f.symbol}),
+            },
+        )
+    else:
+        bus.emit(
+            "stage",
+            agent="VAR_VALUE_EXPLORE",
+            stage="explore",
+            title="VAR_VALUE_EXPLORE idle — not summoned",
+            activity="symbols were clear after call_path",
+        )
 
     bus.emit(
         "stage",
         stage="merge",
         title="Merge + snippet check",
-        activity="both explorers done — attaching facts to path classes",
+        activity="attaching explore facts to path classes",
         detail=f"call_facts={len(call_pack.facts)} var_facts={len(var_pack.facts)}",
     )
     merged = merge_packs(prep, call_pack, var_pack, source)
@@ -246,7 +216,7 @@ def run_pipeline(
         stage="prove",
         title="Starting TP_PROVE + FP_PROVE",
         detail=(
-            "Explorers finished. Compacted packs attached. "
+            "Explore finished. "
             f"call_facts={len(call_pack.facts)} var_facts={len(var_pack.facts)}. "
             "Provers starting now (no tools)."
         ),
@@ -309,10 +279,7 @@ def run_pipeline(
             detail=focus,
             activity="one re-explore pass",
         )
-        call2 = run_call_path_explore(
-            prep, source, max_rounds=cfg.max_tool_rounds, focus=focus, bus=bus
-        )
-        var2 = run_var_value_explore(
+        call2, var2 = run_call_path_explore(
             prep, source, max_rounds=cfg.max_tool_rounds, focus=focus, bus=bus
         )
         write_json(out / "07_reexplore_call_path.json", call2)

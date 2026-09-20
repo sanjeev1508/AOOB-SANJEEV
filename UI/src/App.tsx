@@ -551,7 +551,7 @@ function AgentChat({
     push({ role: "user", text: `Classify alarm order ${alarm}` });
     push({
       role: "assistant",
-      text: "Starting LangGraph pipeline…\n1) CALL_PATH_EXPLORE + VAR_VALUE_EXPLORE run first\n2) Their returned packs are shown here when done\n3) Then TP_PROVE + FP_PROVE start",
+      text: "Starting LangGraph pipeline…\n1) CALL_PATH_EXPLORE walks the path & tracks values\n2) VAR_VALUE_EXPLORE runs only for unclear symbols (sidebar)\n3) Then TP_PROVE + FP_PROVE",
     });
     try {
       await api(`/api/pvers/${encodeURIComponent(pver)}/alarms/${encodeURIComponent(alarm)}/classify`, {

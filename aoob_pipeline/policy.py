@@ -62,17 +62,20 @@ def prefer_label_after_gates(
     *,
     ironclad: bool,
 ) -> tuple[str, str | None]:
-    """Clamp a model vote under the never-miss-TP policy."""
+    """Clamp a model vote under the never-miss-TP policy (less uncertain bias)."""
     label = vote
     note = None
     if validated.tp.claim == "tp" and validated.tp.witness == "found":
         if label == "FP":
-            label, note = "uncertain", "clamped FP→uncertain (TP witness present)"
-        # Allow TP or uncertain; prefer TP when witness is validated
-        if label == "uncertain":
-            pass
+            label, note = "TP", "clamped FP→TP (validated witness)"
+        elif label == "uncertain":
+            label, note = "TP", "clamped uncertain→TP (validated witness)"
         elif label != "TP":
             label, note = "TP", "clamped →TP (validated witness)"
     elif label == "FP" and not ironclad:
-        label, note = "uncertain", "clamped FP→uncertain (evidence not ironclad)"
+        # Prefer TP claim over parking as uncertain when TP argued a case
+        if validated.tp.claim == "tp":
+            label, note = "TP", "clamped FP→TP (not ironclad; TP claim stands)"
+        else:
+            label, note = "uncertain", "clamped FP→uncertain (evidence not ironclad)"
     return label, note

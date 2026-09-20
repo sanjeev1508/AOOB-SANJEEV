@@ -203,8 +203,55 @@ def dataflow_symbol_paths(prep: PrepPack) -> list[dict[str, Any]]:
     return paths
 
 
+def unclear_symbols(prep: PrepPack, facts: list[Fact]) -> list[str]:
+    """Symbols whose value/bound/size is still unclear after CALL_PATH facts.
+
+    Used to decide on-demand VAR_VALUE_EXPLORE for specific symbols only.
+    """
+    by_sym: dict[str, list[Fact]] = {}
+    for f in facts:
+        name = (f.symbol or "").strip()
+        if not name:
+            continue
+        by_sym.setdefault(name, []).append(f)
+
+    index_toks = {
+        t
+        for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", prep.index_expression or "")
+        if t not in _C_KEYWORDS
+    }
+
+    unclear: list[str] = []
+    bound_kinds = {"guard", "clamp", "mask", "loop_bound", "local_guard"}
+    for sym in prep.symbols:
+        name = (sym.symbol_name or "").strip()
+        if not name:
+            continue
+        fs = by_sym.get(name, [])
+        kinds = {f.kind for f in fs}
+        has_decl = "declaration" in kinds or bool(sym.declaration_line and sym.declaration_text)
+        has_write = bool(kinds & {"write", "arg_binding"})
+        has_bound = bool(kinds & bound_kinds)
+        has_size = "array_size_hint" in kinds or (
+            prep.array_size is not None and name == (prep.array_name or "")
+        )
+        is_array = name == (prep.array_name or "") or (sym.kind or "") == "array"
+        is_index = name in index_toks or (sym.role or "") == "index"
+
+        reason = None
+        if is_array and not has_size:
+            reason = "array_size_unknown"
+        elif is_index and not has_bound and not has_write and prep.index_origin != "local":
+            reason = "index_value_unclear"
+        elif not has_decl and not has_write and not has_bound:
+            reason = "no_decl_or_write"
+        if reason:
+            unclear.append(name)
+    return list(dict.fromkeys(unclear))
+
+
 def var_symbol_sequence(prep: PrepPack) -> list[str]:
-    """Ordered symbol names the VAR_VALUE agent visits one-by-one."""
+    """Ordered symbol names the VAR_VALUE agent visits one-by-one (legacy/full mode)."""
     out: list[str] = []
     seen: set[str] = set()
     for sym in prep.symbols:

@@ -49,8 +49,8 @@ def apply_hard_gates(
 
     Forced labels:
     - TP when a validated witness exists
-    - uncertain when FP was claimed but is not ironclad
-    - None otherwise (LLM may vote, still clamped later)
+    - FP when ironclad and TP has no witness (decisive FP)
+    - None otherwise (LLM may vote; FP still clamped if not ironclad)
     """
     notes: list[str] = []
     tp, fp = validated.tp, validated.fp
@@ -65,12 +65,13 @@ def apply_hard_gates(
         notes.append("gate: validated TP witness present")
         force = "TP"
         notes.append("gate: force TP (never miss a witnessed bug)")
-    elif fp.claim == "fp" and not ironclad:
-        force = "uncertain"
-        notes.append("gate: force uncertain (FP not ironclad — protect real TPs)")
     elif fp.claim == "fp" and ironclad and not (tp.claim == "tp" and tp.witness == "found"):
-        # Do not auto-force FP — still require unanimous final votes.
-        notes.append("gate: FP eligible (ironclad); requires unanimous final votes")
+        # Decisive ironclad FP — do not park as uncertain
+        force = "FP"
+        notes.append("gate: force FP (ironclad; no TP witness)")
+    elif fp.claim == "fp" and not ironclad:
+        # Do NOT force uncertain — let the judge weigh TP vs incomplete FP
+        notes.append("gate: FP claimed but not ironclad — judge may pick TP/uncertain (FP votes clamped)")
     return force, notes, ironclad
 
 
@@ -86,7 +87,7 @@ def _one_final_vote(
         "policy": {
             "wrong_fp_is_worst_error": True,
             "fp_requires_ironclad_full_trace": True,
-            "default_when_unsure": "uncertain",
+            "default_when_unsure": "pick_stronger_claim_else_uncertain",
             "fp_currently_ironclad": ironclad,
         },
         "tp": validated.tp.model_dump(),
@@ -208,6 +209,26 @@ def run_final_classification(
             hard_gates=gates,
         )
 
+    if force == "FP":
+        if bus:
+            bus.emit(
+                "stage",
+                agent="FINAL_CLASSIFICATION",
+                stage="final",
+                title="Hard gate → FP",
+                detail="; ".join(gates),
+                activity="forced FP (ironclad; no TP witness)",
+            )
+        return FinalVerdict(
+            label="FP",
+            rationale="Hard gate: ironclad FP checklist and no validated TP witness.",
+            tp_summary=validated.tp.rationale,
+            fp_summary=validated.fp.rationale,
+            votes=["FP"],
+            run_details=[{"forced": True, "reason": "fp_ironclad"}],
+            hard_gates=gates,
+        )
+
     # Both provers failed → nothing to adjudicate. Do not burn N LLM calls on
     # garbage; the answer is uncertain by construction.
     if validated.tp.error and validated.fp.error:
@@ -241,8 +262,6 @@ def run_final_classification(
             validated, ironclad=ironclad, bus=bus, run_idx=i + 1, temperature=temp
         )
         label, note = prefer_label_after_gates(one["label"], validated, ironclad=ironclad)
-        if force == "uncertain" and label == "FP":
-            label, note = "uncertain", "forced uncertain (FP not ironclad)"
         if note:
             one = {**one, "label": label, "clamped": note}
         else:
@@ -255,20 +274,23 @@ def run_final_classification(
             focus = one.get("reexplore_focus") or focus
 
     counts = Counter(votes)
-    # Unanimous FP required when ironclad; any dissent → uncertain.
-    if "FP" in counts:
-        if counts["FP"] < len(votes) or not ironclad:
+    # Majority FP when ironclad (no longer require unanimous — reduces uncertain bias).
+    if "FP" in counts and ironclad and counts["FP"] * 2 >= len(votes):
+        winner = "FP"
+        if counts["FP"] < len(votes):
+            gates = [*gates, "majority: FP accepted with ironclad majority"]
+    elif "FP" in counts and not ironclad:
+        winner = counts.most_common(1)[0][0]
+        if winner == "FP":
             winner = "uncertain"
-            gates = [*gates, "majority: FP requires unanimous ironclad votes"]
-        else:
-            winner = "FP"
+            gates = [*gates, "majority: FP clamped (not ironclad)"]
     elif len(counts) > 1 and counts.most_common(1)[0][1] < len(votes):
         top_n = counts.most_common()
         if len(top_n) > 1 and top_n[0][1] == top_n[1][1]:
-            winner = "uncertain"
-        elif top_n[0][1] < len(votes):
-            # Prefer TP over uncertain only if TP won a plurality and witness exists
-            if top_n[0][0] == "TP" and validated.tp.witness == "found":
+            # Tie: prefer TP if plurality includes TP with witness, else stronger claim
+            if "TP" in counts and validated.tp.witness == "found":
+                winner = "TP"
+            elif "TP" in counts and validated.tp.claim == "tp":
                 winner = "TP"
             else:
                 winner = "uncertain"
@@ -288,7 +310,7 @@ def run_final_classification(
     if winner == "FP":
         rationale = (
             "Ironclad FP: full coverage, known size, bounded index on all path classes, "
-            "unanimous votes, no TP witness. " + str(rationale)
+            "no TP witness. " + str(rationale)
         )
 
     verdict = FinalVerdict(

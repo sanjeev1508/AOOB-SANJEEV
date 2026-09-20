@@ -219,6 +219,17 @@ export type AgentFocus = {
     functions?: string[];
     edges?: Array<{ s: string; t: string }>;
   }>;
+  /** VAR on-demand stream — shown in dataflow sidebar, not FullGraph markers */
+  var_focus?: {
+    current_symbol?: string | null;
+    symbols?: string[];
+    index?: number;
+    total?: number;
+    status?: string;
+    primary_function?: string;
+    requested_by?: string;
+    agent?: string;
+  };
 };
 
 export type PipelineEvent = {

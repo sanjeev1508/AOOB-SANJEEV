@@ -88,4 +88,4 @@ def test_tp_witness_blocks_fp() -> None:
         fp=v.fp,
     )
     label, _ = prefer_label_after_gates("FP", v, ironclad=True)
-    assert label == "uncertain"
+    assert label == "TP"

@@ -124,10 +124,9 @@ export default function FullGraph({
   const [accessFilter, setAccessFilter] = useState<AccessFilter>("all");
   const [markerPos, setMarkerPos] = useState<{
     call?: { x: number; y: number; label: string; meta?: string };
-    var?: { x: number; y: number; label: string; meta?: string };
   }>({});
   const animRef = useRef<number | null>(null);
-  const lastCursorRef = useRef<{ call?: string | null; var?: string | null }>({});
+  const lastCursorRef = useRef<{ call?: string | null }>({});
 
   const variables = useMemo(() => alarmVariables(detail), [detail]);
   const sequences = useMemo(() => {
@@ -163,6 +162,16 @@ export default function FullGraph({
     setExpanded(new Set());
     setAccessFilter("all");
   }, [detail?.order_id, graph]);
+
+  // When VAR is summoned for a symbol, highlight it in the dataflow list
+  useEffect(() => {
+    const sym = agentFocus?.var_focus?.current_symbol;
+    if (!sym || !variables.length) return;
+    const idx = variables.findIndex(
+      (item) => (item.symbol_name ?? item.array_name) === sym,
+    );
+    if (idx >= 0) setSelectedVariable(idx);
+  }, [agentFocus?.var_focus?.current_symbol, agentFocus?.var_focus?.status, variables]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -346,7 +355,6 @@ export default function FullGraph({
       }
     }
     const callCursor = resolveNode(g, agentFocus?.cursors?.CALL_PATH_EXPLORE?.current || "");
-    const varCursor = resolveNode(g, agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current || "");
 
     const agentNodes = new Set(
       (agentFocus?.functions ?? [])
@@ -369,19 +377,11 @@ export default function FullGraph({
       const isExpanded = expanded.has(id);
       const isCallee = calleeOf.has(id);
       const isCallCursor = callCursor === id;
-      const isVarCursor = varCursor === id;
       const onCallPath = callNodes.has(id);
       const onVarPath = varNodes.has(id);
       const isAgent = agentNodes.has(id);
-      if (isCallCursor && isVarCursor) {
-        // Both explorers parked on the same function — call color, oversized marker
+      if (isCallCursor) {
         g.setNodeAttribute(id, "color", C.callPath);
-        g.setNodeAttribute(id, "size", Math.max(16, base * 4.8));
-        g.setNodeAttribute(id, "label", id);
-        g.setNodeAttribute(id, "forceLabel", true);
-        g.setNodeAttribute(id, "zIndex", 7);
-      } else if (isCallCursor || isVarCursor) {
-        g.setNodeAttribute(id, "color", isCallCursor ? C.callPath : C.varPath);
         g.setNodeAttribute(id, "size", Math.max(14, base * 4.2));
         g.setNodeAttribute(id, "label", id);
         g.setNodeAttribute(id, "forceLabel", true);
@@ -504,7 +504,6 @@ export default function FullGraph({
     };
 
     const animateMarker = (
-      key: "call" | "var",
       fromName: string | null | undefined,
       toName: string | null | undefined,
       label: string,
@@ -514,7 +513,7 @@ export default function FullGraph({
       if (!to) return;
       const from = nodeViewport(fromName);
       if (!from || !fromName || fromName === toName) {
-        setMarkerPos((current) => ({ ...current, [key]: { x: to.x, y: to.y, label, meta } }));
+        setMarkerPos({ call: { x: to.x, y: to.y, label, meta } });
         return;
       }
       const start = performance.now();
@@ -524,7 +523,7 @@ export default function FullGraph({
         const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
         const x = from.x + (to.x - from.x) * ease;
         const y = from.y + (to.y - from.y) * ease;
-        setMarkerPos((current) => ({ ...current, [key]: { x, y, label, meta } }));
+        setMarkerPos({ call: { x, y, label, meta } });
         if (t < 1) animRef.current = requestAnimationFrame(tick);
       };
       if (animRef.current) cancelAnimationFrame(animRef.current);
@@ -532,13 +531,10 @@ export default function FullGraph({
     };
 
     const callCur = agentFocus?.cursors?.CALL_PATH_EXPLORE;
-    const varCur = agentFocus?.cursors?.VAR_VALUE_EXPLORE;
     const callTarget = callCur?.current || null;
-    const varTarget = varCur?.current || null;
 
     if (callTarget !== lastCursorRef.current.call) {
       animateMarker(
-        "call",
         callCur?.prev || lastCursorRef.current.call,
         callTarget,
         callTarget || "",
@@ -548,53 +544,23 @@ export default function FullGraph({
     } else if (callTarget) {
       const at = nodeViewport(callTarget);
       if (at) {
-        setMarkerPos((current) => ({
-          ...current,
+        setMarkerPos({
           call: {
             x: at.x,
             y: at.y,
             label: callTarget,
             meta: callCur?.index && callCur?.total ? `${callCur.index}/${callCur.total}` : undefined,
           },
-        }));
+        });
       }
     } else {
-      setMarkerPos((current) => ({ ...current, call: undefined }));
-    }
-
-    if (varTarget !== lastCursorRef.current.var) {
-      animateMarker(
-        "var",
-        varCur?.prev || lastCursorRef.current.var,
-        varTarget,
-        varCur?.current_symbol || varTarget || "",
-        varCur?.index && varCur?.total ? `${varCur.index}/${varCur.total}` : undefined,
-      );
-      lastCursorRef.current.var = varTarget;
-    } else if (varTarget) {
-      const at = nodeViewport(varTarget);
-      if (at) {
-        setMarkerPos((current) => ({
-          ...current,
-          var: {
-            x: at.x,
-            y: at.y,
-            label: varCur?.current_symbol || varTarget,
-            meta: varCur?.index && varCur?.total ? `${varCur.index}/${varCur.total}` : undefined,
-          },
-        }));
-      }
-    } else {
-      setMarkerPos((current) => ({ ...current, var: undefined }));
+      setMarkerPos({});
     }
 
     const onCam = () => {
-      // Re-project without re-animating when the camera pans/zooms manually
       const callAt = nodeViewport(lastCursorRef.current.call);
-      const varAt = nodeViewport(lastCursorRef.current.var);
       setMarkerPos((current) => ({
         call: callAt && current.call ? { ...current.call, x: callAt.x, y: callAt.y } : current.call,
-        var: varAt && current.var ? { ...current.var, x: varAt.x, y: varAt.y } : current.var,
       }));
     };
     renderer.getCamera().on("updated", onCam);
@@ -660,14 +626,6 @@ export default function FullGraph({
                   : ""}
               </em>
             ) : null}
-            {agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current ? (
-              <em className="cursor-var">
-                var@{agentFocus.cursors.VAR_VALUE_EXPLORE.current}
-                {agentFocus.cursors.VAR_VALUE_EXPLORE.symbols?.length
-                  ? ` · ${agentFocus.cursors.VAR_VALUE_EXPLORE.symbols.slice(0, 4).join(",")}`
-                  : ""}
-              </em>
-            ) : null}
           </div>
         ) : null}
         <div className="agent-marker-layer" aria-hidden>
@@ -681,19 +639,6 @@ export default function FullGraph({
                 CALL
                 <em>{markerPos.call.label}</em>
                 {markerPos.call.meta ? <small>{markerPos.call.meta}</small> : null}
-              </span>
-            </div>
-          ) : null}
-          {markerPos.var ? (
-            <div
-              className="agent-node-marker var"
-              style={{ left: markerPos.var.x, top: markerPos.var.y }}
-            >
-              <span className="marker-dot" />
-              <span className="marker-label">
-                VAR
-                <em>{markerPos.var.label}</em>
-                {markerPos.var.meta ? <small>{markerPos.var.meta}</small> : null}
               </span>
             </div>
           ) : null}
@@ -741,6 +686,29 @@ export default function FullGraph({
           </div>
           <span className="count-pill">{selected ? rows.length : variables.length}</span>
         </div>
+        {agentFocus?.var_focus?.current_symbol || agentFocus?.var_focus?.status ? (
+          <div className={`var-agent-stream status-${agentFocus.var_focus.status || "idle"}`}>
+            <strong>VAR_VALUE_EXPLORE</strong>
+            <span>
+              {agentFocus.var_focus.status === "done"
+                ? "returned to CALL_PATH"
+                : agentFocus.var_focus.status === "requested"
+                  ? "summoned by CALL_PATH"
+                  : agentFocus.var_focus.status || "idle"}
+            </span>
+            <em>
+              {agentFocus.var_focus.current_symbol || "—"}
+              {agentFocus.var_focus.index && agentFocus.var_focus.total
+                ? ` · ${agentFocus.var_focus.index}/${agentFocus.var_focus.total}`
+                : ""}
+            </em>
+            {(agentFocus.var_focus.symbols?.length ?? 0) > 1 ? (
+              <code>{agentFocus.var_focus.symbols?.join(" → ")}</code>
+            ) : null}
+          </div>
+        ) : (
+          <p className="var-agent-idle">VAR agent idle — runs only when CALL_PATH flags an unclear symbol.</p>
+        )}
         {!detail ? (
           <p className="location">Search an alarm order to list variables and the functions that use them.</p>
         ) : selected ? (
@@ -776,23 +744,28 @@ export default function FullGraph({
           <>
             <p className="location">Choose a variable to list the functions it is present in.</p>
             <div className="variable-list">
-              {variables.length ? variables.map((item, index) => (
+              {variables.length ? variables.map((item, index) => {
+                const name = item.symbol_name ?? item.array_name ?? "unknown symbol";
+                const active = agentFocus?.var_focus?.current_symbol === name
+                  || agentFocus?.var_focus?.symbols?.includes(name);
+                return (
                 <button
                   key={`${item.symbol_name ?? item.array_name}-${index}`}
-                  className="variable-item"
+                  className={`variable-item${active ? " var-active" : ""}`}
                   onClick={() => {
                     setSelectedVariable(index);
                     setAccessFilter("all");
                   }}
                 >
                   <strong>
-                    {item.symbol_name ?? item.array_name ?? "unknown symbol"}
+                    {name}
                     {(item.role === "flagged_array") && <span className="flag-badge">flagged</span>}
+                    {active ? <span className="flag-badge var-badge">VAR</span> : null}
                   </strong>
                   <code>{item.kind ?? "symbol"}{item.role ? ` · ${item.role}` : ""}{item.index_expression ? ` · ${item.index_expression}` : ""}</code>
-                  <span className="variable-summary">{item.occurrence_count ?? item.occurrences?.length ?? 0} occurrences · {(item.used_in_functions ?? []).filter((name) => name && name !== "global").length} functions</span>
+                  <span className="variable-summary">{item.occurrence_count ?? item.occurrences?.length ?? 0} occurrences · {(item.used_in_functions ?? []).filter((fn) => fn && fn !== "global").length} functions</span>
                 </button>
-              )) : (
+              ); }) : (
                 <div className="muted">No variable metadata for this alarm.</div>
               )}
             </div>

@@ -2,33 +2,34 @@
 
 from __future__ import annotations
 
-CALL_PATH_EXPLORE = """You are CALL_PATH_EXPLORE — control-flow explorer for Astrée array-OOB triage.
+CALL_PATH_EXPLORE = """You are CALL_PATH_EXPLORE — primary explorer for Astrée array-OOB triage.
 
 ## Role
-Walk the given function_sequence with tools. For every function, open its body,
-confirm call edges / argument passing toward the alarm site, and record
-quoted facts. You do NOT decide TP/FP.
+You own the explore pass. Walk the function_sequence, pull declaration info,
+and track how each dataflow symbol's value flows toward the alarm site.
+You do NOT decide TP/FP.
+
+When a specific symbol's value / size / bound is still unclear after reading
+the path bodies, the orchestrator may summon VAR_VALUE_EXPLORE for THAT symbol
+only and hand its facts back to you.
 
 ## Tool output format
 get_current / get_func return:
-- PSEUDO: compact logic (aliases, maps, buffer copies) — use for understanding
+- PSEUDO: compact logic — use for understanding
 - CITE: exact ``line: C`` rows — copy quotes ONLY from CITE
 
 ## Required tool workflow
 1. Read function_sequence from the case brief (ordered list).
 2. Call get_current() to load the current function (pseudocode + CITE).
-3. Reason from PSEUDO; emit facts with exact line + quote from CITE only.
-4. Call move_func(direction="next") to advance; repeat until every sequence
-   function has been opened (visit_status.remaining is empty).
-5. Only then call submit_explore_pack(facts_json=...).
-
-Optional: get_func(name=...) for a helper named in the body; get_lines(start,end)
-for a tight window of raw C. Prefer get_current for sequence coverage.
+3. Emit facts: call edges, arg bindings, declarations, writes, and value-shaping
+   steps for the listed symbols.
+4. Call move_func(direction="next"); repeat until remaining is empty.
+5. submit_explore_pack only after full sequence coverage.
 
 ## Fact rules
-- kind examples: call_edge, arg_binding, alarm_site, path_step
-- Every fact MUST include function, line, quote copied from the CITE block.
-- Never invent sizes, values, or guards.
+- kind examples: call_edge, arg_binding, alarm_site, path_step, declaration, write
+- Every fact MUST include function, line, quote from CITE, and symbol when known.
+- Never invent array sizes or index ranges.
 - If a step has no call edge (single-function path), still open it and record
   the alarm-site / index access lines you see.
 
@@ -37,26 +38,17 @@ submit_explore_pack is REJECTED until every sequence function was opened via
 get_current/get_func. Empty fact lists are REJECTED.
 """
 
-VAR_VALUE_EXPLORE = """You are VAR_VALUE_EXPLORE — data/value explorer for Astrée array-OOB triage.
+VAR_VALUE_EXPLORE = """You are VAR_VALUE_EXPLORE — on-demand symbol deep-dive for Astrée array-OOB triage.
 
 ## Role
-Visit symbols ONE AT A TIME from the dataflow list (not function-to-function).
-For each symbol you receive a deterministic package: its function list plus merged
-±3 line windows around every listed occurrence (declaration / write / guard / access).
-Extract declaration / write / value-shaping evidence for THAT symbol only.
-Include guards, clamps, masks, loop bounds, and call-argument bindings. Skip pure
-reads EXCEPT when the line is a guard/clamp/mask/loop-bound. You do NOT decide TP/FP.
-Tag each fact with the exact ``symbol`` it concerns.
-
-## Tool / package workflow
-1. Read the current symbol package (functions + windowed CITE lines).
-2. Extract quoted facts for this symbol only.
-3. Proceed to the next symbol until the symbol list is exhausted.
-4. submit_explore_pack only after every symbol was covered.
+You run ONLY when CALL_PATH_EXPLORE flags a specific symbol as unclear.
+Inspect that symbol's ±3 line windows from the dataflow list and return
+declaration / write / size / bound facts for THAT symbol alone.
+Hand results back to CALL_PATH. You do NOT decide TP/FP.
 
 ## Fact rules
 - Every fact MUST include function, line, quote from the package CITE lines, and symbol.
-- Never invent array sizes or index ranges — only quote what the source shows.
+- Never invent array sizes or index ranges.
 - Empty fact lists are REJECTED.
 """
 
@@ -82,6 +74,7 @@ Focus (call_path): how the index value reaches the alarm through this function:
 - kind "arg_binding": the call that passes the index (or its source) to the next function.
 - kind "call_edge": a call on the path toward the alarm function.
 - kind "path_step": a statement on the path that constrains or transforms the index.
+- kind "declaration" / "write": when this body declares or assigns a tracked symbol.
 """
 
 CODE_DRIVEN_VAR_VALUE = _CODE_DRIVEN_COMMON + """
@@ -114,8 +107,7 @@ Never invent values.
 - claim=tp and witness=found only with quoted findings that support the witness.
 - If evidence is incomplete but OOB is still plausible, prefer
   claim=no_credible_case and list missing_evidence clearly — do NOT invent a
-  witness. The final judge will keep those cases as uncertain (human review),
-  which is correct.
+  witness.
 - Never pressure toward FP.
 
 ## Input shape
@@ -164,25 +156,26 @@ missing_evidence (string[]), addressed_path_classes (string[]),
 unaddressed_path_classes (string[]), rationale (string).
 """
 
-FINAL_CLASSIFICATION = """You are FINAL_CLASSIFICATION — strict adjudicator for Astrée array-OOB triage.
+FINAL_CLASSIFICATION = """You are FINAL_CLASSIFICATION — adjudicator for Astrée array-OOB triage.
 
-## Product goal (non-negotiable)
-1. NEVER miss a real TP. A wrong FP is the worst outcome.
-2. Label FP only when the FP report is ironclad: full coverage, every path
+## Product goal
+1. NEVER miss a real TP. A wrong FP is still the worst outcome.
+2. When evidence clearly supports TP or FP, pick that label — do not default
+   to uncertain out of caution when one side is decisive.
+3. Label FP only when the FP report is ironclad: full coverage, every path
    class addressed, array_size known, index_range constant or guard_bounded,
    validated findings, empty missing_evidence, and no TP witness.
-3. Otherwise choose uncertain (human review) or TP (validated witness).
-4. When in doubt between FP and uncertain → uncertain.
-5. When in doubt between uncertain and TP with a validated witness → TP.
-6. Default when evidence is thin → uncertain (not FP).
+4. Label TP when TP claim=tp and witness=found with validated findings.
+5. Choose uncertain only on genuine conflict, thin/contradictory evidence, or
+   when neither side is decisive.
+6. When in doubt between uncertain and TP with a validated witness → TP.
+7. When FP is ironclad and TP has no witness → FP (not uncertain).
 
 Hard rules:
 - FP only if the ironclad checklist above is fully satisfied.
 - TP if TP claim=tp and witness=found with validated findings.
-- uncertain on conflict, partial coverage, unknown size/bounds, or missing evidence.
-- Bias: FP ≪ uncertain ≤ TP (cost order: wrong FP is worst).
-- reexplore_requested only to fill a specific missing bound/size gap — never to
-  shop for an FP.
+- uncertain only when conflicted or evidence is truly insufficient.
+- reexplore_requested only to fill a specific missing bound/size gap.
 
 Return JSON only:
 {"label":"TP"|"FP"|"uncertain","rationale":"...","reexplore_requested":false,"reexplore_focus":null}
