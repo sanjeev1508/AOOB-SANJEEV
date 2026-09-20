@@ -111,7 +111,7 @@ class EventBus:
         return event
 
 
-def _clip(text: str | None, limit: int = 2400) -> str | None:
+def _clip(text: str | None, limit: int = 8000) -> str | None:
     if text is None:
         return None
     raw = str(text)

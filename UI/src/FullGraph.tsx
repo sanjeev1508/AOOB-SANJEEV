@@ -122,6 +122,12 @@ export default function FullGraph({
   const [showEdges, setShowEdges] = useState(false);
   const [selectedVariable, setSelectedVariable] = useState<number | null>(null);
   const [accessFilter, setAccessFilter] = useState<AccessFilter>("all");
+  const [markerPos, setMarkerPos] = useState<{
+    call?: { x: number; y: number; label: string; meta?: string };
+    var?: { x: number; y: number; label: string; meta?: string };
+  }>({});
+  const animRef = useRef<number | null>(null);
+  const lastCursorRef = useRef<{ call?: string | null; var?: string | null }>({});
 
   const variables = useMemo(() => alarmVariables(detail), [detail]);
   const sequences = useMemo(() => {
@@ -233,7 +239,7 @@ export default function FullGraph({
     });
     const stale: string[] = [];
     g.forEachEdge((id) => {
-      if (id.startsWith("hl:")) stale.push(id);
+      if (id.startsWith("hl:") || id.startsWith("df:") || id.startsWith("cp:")) stale.push(id);
     });
     stale.forEach((id) => g.dropEdge(id));
     sequenceEdges(sequences).forEach(([source, target]) => {
@@ -254,6 +260,36 @@ export default function FullGraph({
         pathEdges.add(overlay);
       }
     });
+    const ensureOverlayEdge = (
+      fromRaw: string,
+      toRaw: string,
+      prefix: "df" | "cp",
+      color: string,
+      size: number,
+      bucket: Set<string>,
+    ) => {
+      const from = resolveNode(g, fromRaw);
+      const to = resolveNode(g, toRaw);
+      if (!from || !to || from === to) return;
+      const key = `${from}->${to}`;
+      bucket.add(key);
+      if (g.hasEdge(from, to)) return;
+      const overlay = `${prefix}:${key}`;
+      if (g.hasEdge(overlay)) {
+        bucket.add(overlay);
+        return;
+      }
+      g.addEdgeWithKey(overlay, from, to, {
+        size,
+        color,
+        hidden: false,
+        originalSize: size,
+        zIndex: prefix === "cp" ? 5 : 4,
+        synthetic: true,
+      });
+      bucket.add(overlay);
+    };
+
     const active = Boolean(highlight?.center || resolved.length);
     const calleeOf = new Map<string, string>();
     const expandEdges = new Set<string>();
@@ -272,18 +308,14 @@ export default function FullGraph({
     const callNodes = new Set(
       callSeq.map((name) => resolveNode(g, name)).filter((name): name is string => Boolean(name)),
     );
-    const callEdgeKeys = new Set(
-      (agentFocus?.call_path?.edges?.length
+    const callEdgeKeys = new Set<string>();
+    const callEdgeList =
+      agentFocus?.call_path?.edges?.length
         ? agentFocus.call_path.edges
-        : callSeq.slice(0, -1).map((s, i) => ({ s, t: callSeq[i + 1] }))
-      )
-        .map((edge) => {
-          const from = resolveNode(g, edge.s);
-          const to = resolveNode(g, edge.t);
-          return from && to ? `${from}->${to}` : "";
-        })
-        .filter(Boolean),
-    );
+        : callSeq.slice(0, -1).map((s, i) => ({ s, t: callSeq[i + 1] }));
+    for (const edge of callEdgeList) {
+      ensureOverlayEdge(edge.s, edge.t, "cp", C.callPathEdge, 2.4, callEdgeKeys);
+    }
 
     const varEdgeKeys = new Set<string>();
     const varNodes = new Set<string>();
@@ -292,10 +324,16 @@ export default function FullGraph({
         const resolved = resolveNode(g, name);
         if (resolved) varNodes.add(resolved);
       }
-      for (const edge of path.edges ?? []) {
-        const from = resolveNode(g, edge.s);
-        const to = resolveNode(g, edge.t);
-        if (from && to) varEdgeKeys.add(`${from}->${to}`);
+      // Always connect consecutive dataflow functions — even when CFG has no edge
+      const funcs = path.functions ?? [];
+      if (path.edges?.length) {
+        for (const edge of path.edges) {
+          ensureOverlayEdge(edge.s, edge.t, "df", C.varPathEdge, 1.4, varEdgeKeys);
+        }
+      } else {
+        for (let i = 0; i < funcs.length - 1; i += 1) {
+          ensureOverlayEdge(funcs[i], funcs[i + 1], "df", C.varPathEdge, 1.4, varEdgeKeys);
+        }
       }
     }
     // Also include the var explorer's current sequence as a soft path
@@ -304,12 +342,9 @@ export default function FullGraph({
       const resolved = resolveNode(g, varSeq[i]);
       if (resolved) varNodes.add(resolved);
       if (i > 0) {
-        const from = resolveNode(g, varSeq[i - 1]);
-        const to = resolveNode(g, varSeq[i]);
-        if (from && to) varEdgeKeys.add(`${from}->${to}`);
+        ensureOverlayEdge(varSeq[i - 1], varSeq[i], "df", C.varPathEdge, 1.4, varEdgeKeys);
       }
     }
-
     const callCursor = resolveNode(g, agentFocus?.cursors?.CALL_PATH_EXPLORE?.current || "");
     const varCursor = resolveNode(g, agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current || "");
 
@@ -450,6 +485,125 @@ export default function FullGraph({
   // No auto-zoom on agent focus / path changes — keep the full graph view stable.
   // Manual Fit / Zoom to path buttons remain available.
 
+  // Place agent elements inside their function nodes; animate along edges on move.
+  useEffect(() => {
+    const renderer = sigmaRef.current;
+    const g = graphRef.current;
+    if (!renderer || !g) {
+      setMarkerPos({});
+      return;
+    }
+
+    const nodeViewport = (name: string | null | undefined) => {
+      if (!name) return null;
+      const id = resolveNode(g, name);
+      if (!id) return null;
+      const data = renderer.getNodeDisplayData(id);
+      if (!data) return null;
+      return renderer.graphToViewport({ x: data.x, y: data.y });
+    };
+
+    const animateMarker = (
+      key: "call" | "var",
+      fromName: string | null | undefined,
+      toName: string | null | undefined,
+      label: string,
+      meta?: string,
+    ) => {
+      const to = nodeViewport(toName);
+      if (!to) return;
+      const from = nodeViewport(fromName);
+      if (!from || !fromName || fromName === toName) {
+        setMarkerPos((current) => ({ ...current, [key]: { x: to.x, y: to.y, label, meta } }));
+        return;
+      }
+      const start = performance.now();
+      const duration = 520;
+      const tick = (now: number) => {
+        const t = Math.min(1, (now - start) / duration);
+        const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+        const x = from.x + (to.x - from.x) * ease;
+        const y = from.y + (to.y - from.y) * ease;
+        setMarkerPos((current) => ({ ...current, [key]: { x, y, label, meta } }));
+        if (t < 1) animRef.current = requestAnimationFrame(tick);
+      };
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+      animRef.current = requestAnimationFrame(tick);
+    };
+
+    const callCur = agentFocus?.cursors?.CALL_PATH_EXPLORE;
+    const varCur = agentFocus?.cursors?.VAR_VALUE_EXPLORE;
+    const callTarget = callCur?.current || null;
+    const varTarget = varCur?.current || null;
+
+    if (callTarget !== lastCursorRef.current.call) {
+      animateMarker(
+        "call",
+        callCur?.prev || lastCursorRef.current.call,
+        callTarget,
+        callTarget || "",
+        callCur?.index && callCur?.total ? `${callCur.index}/${callCur.total}` : undefined,
+      );
+      lastCursorRef.current.call = callTarget;
+    } else if (callTarget) {
+      const at = nodeViewport(callTarget);
+      if (at) {
+        setMarkerPos((current) => ({
+          ...current,
+          call: {
+            x: at.x,
+            y: at.y,
+            label: callTarget,
+            meta: callCur?.index && callCur?.total ? `${callCur.index}/${callCur.total}` : undefined,
+          },
+        }));
+      }
+    } else {
+      setMarkerPos((current) => ({ ...current, call: undefined }));
+    }
+
+    if (varTarget !== lastCursorRef.current.var) {
+      animateMarker(
+        "var",
+        varCur?.prev || lastCursorRef.current.var,
+        varTarget,
+        varCur?.current_symbol || varTarget || "",
+        varCur?.index && varCur?.total ? `${varCur.index}/${varCur.total}` : undefined,
+      );
+      lastCursorRef.current.var = varTarget;
+    } else if (varTarget) {
+      const at = nodeViewport(varTarget);
+      if (at) {
+        setMarkerPos((current) => ({
+          ...current,
+          var: {
+            x: at.x,
+            y: at.y,
+            label: varCur?.current_symbol || varTarget,
+            meta: varCur?.index && varCur?.total ? `${varCur.index}/${varCur.total}` : undefined,
+          },
+        }));
+      }
+    } else {
+      setMarkerPos((current) => ({ ...current, var: undefined }));
+    }
+
+    const onCam = () => {
+      // Re-project without re-animating when the camera pans/zooms manually
+      const callAt = nodeViewport(lastCursorRef.current.call);
+      const varAt = nodeViewport(lastCursorRef.current.var);
+      setMarkerPos((current) => ({
+        call: callAt && current.call ? { ...current.call, x: callAt.x, y: callAt.y } : current.call,
+        var: varAt && current.var ? { ...current.var, x: varAt.x, y: varAt.y } : current.var,
+      }));
+    };
+    renderer.getCamera().on("updated", onCam);
+    return () => {
+      renderer.getCamera().off("updated", onCam);
+      if (animRef.current) cancelAnimationFrame(animRef.current);
+    };
+  }, [agentFocus]);
+
   const fit = () => {
     sigmaRef.current?.getCamera().animatedReset({ duration: 400 });
   };
@@ -516,28 +670,35 @@ export default function FullGraph({
             ) : null}
           </div>
         ) : null}
-        <div className="agent-cursor-stack">
-          {agentFocus?.cursors?.CALL_PATH_EXPLORE?.current ? (
-            <div className="agent-cursor-chip call">
-              <span className="chip-tag">CALL_PATH</span>
-              <span className="chip-fn">{agentFocus.cursors.CALL_PATH_EXPLORE.current}</span>
-              <span className="chip-meta">
-                {agentFocus.cursors.CALL_PATH_EXPLORE.index}/{agentFocus.cursors.CALL_PATH_EXPLORE.total || "?"}
+        <div className="agent-marker-layer" aria-hidden>
+          {markerPos.call ? (
+            <div
+              className="agent-node-marker call"
+              style={{ left: markerPos.call.x, top: markerPos.call.y }}
+            >
+              <span className="marker-dot" />
+              <span className="marker-label">
+                CALL
+                <em>{markerPos.call.label}</em>
+                {markerPos.call.meta ? <small>{markerPos.call.meta}</small> : null}
               </span>
             </div>
           ) : null}
-          {agentFocus?.cursors?.VAR_VALUE_EXPLORE?.current ? (
-            <div className="agent-cursor-chip var">
-              <span className="chip-tag">VAR_VALUE</span>
-              <span className="chip-fn">{agentFocus.cursors.VAR_VALUE_EXPLORE.current}</span>
-              <span className="chip-meta">
-                {(agentFocus.cursors.VAR_VALUE_EXPLORE.symbols || []).slice(0, 3).join(", ") || "symbols"}
+          {markerPos.var ? (
+            <div
+              className="agent-node-marker var"
+              style={{ left: markerPos.var.x, top: markerPos.var.y }}
+            >
+              <span className="marker-dot" />
+              <span className="marker-label">
+                VAR
+                <em>{markerPos.var.label}</em>
+                {markerPos.var.meta ? <small>{markerPos.var.meta}</small> : null}
               </span>
             </div>
           ) : null}
         </div>
-        <div className="graph-filters">
-          <label>
+        <div className="graph-filters">          <label>
             <input type="checkbox" checked={showAllLabels} onChange={(event) => setShowAllLabels(event.target.checked)} />
             show function names of all nodes
           </label>

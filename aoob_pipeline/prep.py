@@ -64,16 +64,33 @@ def _symbol_from_info(info: dict[str, Any], *, role_fallback: str | None = None)
         if isinstance(o, dict) and o.get("access") in {"write", "declaration"} and o.get("line")
     ]
     guard_lines: list[int] = []
+    key_lines: list[int] = []
     for occ in occurrences:
         if not isinstance(occ, dict) or not occ.get("line"):
             continue
+        ln = int(occ["line"])
+        key_lines.append(ln)
         text = occ.get("line_text") or ""
         access = (occ.get("access") or "").lower()
         if access == "read" and _GUARD_HINTS.search(text):
-            guard_lines.append(int(occ["line"]))
+            guard_lines.append(ln)
         elif access in {"write", "declaration"}:
             continue
     used = [str(x) for x in (info.get("used_in_functions") or []) if x]
+    decl = info.get("declaration_line")
+    if decl:
+        try:
+            key_lines.append(int(decl))
+        except (TypeError, ValueError):
+            pass
+    # stable unique preserve order
+    seen_ln: set[int] = set()
+    uniq_keys: list[int] = []
+    for ln in key_lines:
+        if ln in seen_ln:
+            continue
+        seen_ln.add(ln)
+        uniq_keys.append(ln)
     return SymbolSkeleton(
         symbol_name=str(info.get("symbol_name") or info.get("array_name") or ""),
         role=str(info.get("role") or role_fallback or ""),
@@ -87,6 +104,7 @@ def _symbol_from_info(info: dict[str, Any], *, role_fallback: str | None = None)
         function_sequence=used,
         write_lines=write_lines,
         guard_candidate_lines=guard_lines,
+        key_lines=uniq_keys,
     )
 
 

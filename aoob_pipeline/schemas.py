@@ -41,6 +41,8 @@ class SymbolSkeleton(BaseModel):
     function_sequence: list[str] = Field(default_factory=list)
     write_lines: list[int] = Field(default_factory=list)
     guard_candidate_lines: list[int] = Field(default_factory=list)
+    # All analyzer occurrence lines (reads/writes/decls) for ±3 window packages
+    key_lines: list[int] = Field(default_factory=list)
 
 
 class LocalGuardHit(BaseModel):

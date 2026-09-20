@@ -12,6 +12,7 @@ from aoob_pipeline.config import pipeline_config
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.explore_graph import run_call_path_explore, run_var_value_explore
 from aoob_pipeline.explore_support import (
+    build_symbol_package,
     call_path_edges,
     call_path_sequence,
     compact_explore_pack,
@@ -131,21 +132,28 @@ def run_pipeline(
         },
         agent="CALL_PATH_EXPLORE",
     )
-    # Seed VAR cursor at its first function so both markers appear immediately
+    # Seed VAR cursor at first symbol's primary function
+    first_sym = prep.symbols[0].symbol_name if prep.symbols else None
+    first_var_fn = None
+    if prep.symbols:
+        pkg0 = build_symbol_package(prep.symbols[0], prep, source, radius=3)
+        first_var_fn = pkg0.get("primary_function") or (vv_seq[0] if vv_seq else None)
     bus.emit(
         "stage",
         stage="explore",
-        title="VAR_VALUE track ready",
-        activity=f"symbols={[s.symbol_name for s in prep.symbols]} seq={len(vv_seq)}",
-        functions=vv_seq[:1] if vv_seq else [],
+        title="VAR_VALUE track ready (symbol-by-symbol)",
+        activity=f"symbols={[s.symbol_name for s in prep.symbols]}",
+        functions=[first_var_fn] if first_var_fn else [],
         agent="VAR_VALUE_EXPLORE",
         var_paths=sym_paths,
         cursor={
-            "current": vv_seq[0] if vv_seq else None,
-            "index": 1 if vv_seq else 0,
-            "total": len(vv_seq),
-            "sequence": vv_seq,
+            "current": first_var_fn,
+            "prev": None,
+            "index": 1 if prep.symbols else 0,
+            "total": len(prep.symbols),
+            "sequence": [p.get("primary") for p in sym_paths if p.get("primary")],
             "symbols": [s.symbol_name for s in prep.symbols],
+            "current_symbol": first_sym,
         },
     )
 
@@ -174,6 +182,42 @@ def run_pipeline(
     write_json(out / "02_var_value_explore.json", var_pack)
 
     bus.emit(
+        "agent_output",
+        agent="CALL_PATH_EXPLORE",
+        stage="explore",
+        title="CALL_PATH_EXPLORE done — returned this output",
+        output_preview=preview_json(
+            {
+                "agent": call_pack.agent,
+                "fact_count": len(call_pack.facts),
+                "facts": [f.model_dump() for f in call_pack.facts[:24]],
+                "notes": call_pack.notes,
+            }
+        ),
+        activity=f"done · {len(call_pack.facts)} facts",
+        functions=cp_seq,
+        edges=cp_edges,
+        call_path={"sequence": cp_seq, "edges": cp_edges},
+    )
+    bus.emit(
+        "agent_output",
+        agent="VAR_VALUE_EXPLORE",
+        stage="explore",
+        title="VAR_VALUE_EXPLORE done — returned this output",
+        output_preview=preview_json(
+            {
+                "agent": var_pack.agent,
+                "fact_count": len(var_pack.facts),
+                "facts": [f.model_dump() for f in var_pack.facts[:24]],
+                "notes": var_pack.notes,
+            }
+        ),
+        activity=f"done · {len(var_pack.facts)} facts",
+        functions=[p.get("primary") for p in sym_paths if p.get("primary")],
+        var_paths=sym_paths,
+    )
+
+    bus.emit(
         "stage",
         stage="merge",
         title="Merge + snippet check",
@@ -200,8 +244,12 @@ def run_pipeline(
     bus.emit(
         "stage",
         stage="prove",
-        title="Provers starting",
-        detail="TP_PROVE + FP_PROVE (no tools)",
+        title="Starting TP_PROVE + FP_PROVE",
+        detail=(
+            "Explorers finished. Compacted packs attached. "
+            f"call_facts={len(call_pack.facts)} var_facts={len(var_pack.facts)}. "
+            "Provers starting now (no tools)."
+        ),
         activity="prove fan-out",
     )
     if parallel_prove:

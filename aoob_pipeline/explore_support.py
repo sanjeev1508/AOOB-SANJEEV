@@ -173,7 +173,11 @@ def call_path_edges(prep: PrepPack) -> list[dict[str, str]]:
 
 
 def dataflow_symbol_paths(prep: PrepPack) -> list[dict[str, Any]]:
-    """Per-symbol function chains for UI dataflow highlighting (all alarm symbols)."""
+    """Per-symbol function chains for UI dataflow highlighting (all alarm symbols).
+
+    Always emits consecutive edges in list order so FullGraph can draw synthetic
+    links even when the CFG has no direct caller→callee between those functions.
+    """
     paths: list[dict[str, Any]] = []
     for sym in prep.symbols:
         name = (sym.symbol_name or "").strip()
@@ -184,7 +188,7 @@ def dataflow_symbol_paths(prep: PrepPack) -> list[dict[str, Any]]:
             funcs = [prep.enclosing_function]
         edges: list[dict[str, str]] = []
         for i in range(len(funcs) - 1):
-            edges.append({"s": funcs[i], "t": funcs[i + 1]})
+            edges.append({"s": funcs[i], "t": funcs[i + 1], "kind": "dataflow"})
         paths.append(
             {
                 "symbol": name,
@@ -193,23 +197,131 @@ def dataflow_symbol_paths(prep: PrepPack) -> list[dict[str, Any]]:
                 "functions": funcs,
                 "edges": edges,
                 "declaration_line": sym.declaration_line,
+                "primary": funcs[0] if funcs else prep.enclosing_function,
             }
         )
     return paths
 
 
+def var_symbol_sequence(prep: PrepPack) -> list[str]:
+    """Ordered symbol names the VAR_VALUE agent visits one-by-one."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for sym in prep.symbols:
+        name = (sym.symbol_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _merge_line_windows(centers: list[int], *, radius: int = 3) -> list[tuple[int, int]]:
+    """Merge overlapping ±radius windows into sorted non-overlapping ranges."""
+    if not centers:
+        return []
+    spans = sorted((max(1, c - radius), c + radius) for c in centers)
+    merged: list[tuple[int, int]] = [spans[0]]
+    for start, end in spans[1:]:
+        prev_s, prev_e = merged[-1]
+        if start <= prev_e + 1:
+            merged[-1] = (prev_s, max(prev_e, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_symbol_package(
+    sym: Any,
+    prep: PrepPack,
+    source: SourceIndex,
+    *,
+    radius: int = 3,
+) -> dict[str, Any]:
+    """Deterministic per-symbol package: dataflow funcs + merged ±radius line windows.
+
+    Does **not** use only the exact listed lines — each key line expands to
+    ``line±radius`` and overlapping windows are merged before the LLM sees them.
+    """
+    name = (sym.symbol_name or "").strip()
+    funcs = [f for f in (sym.function_sequence or []) if f and f != "global"]
+    if not funcs and prep.enclosing_function:
+        funcs = [prep.enclosing_function]
+
+    centers: list[int] = []
+    for ln in getattr(sym, "key_lines", None) or []:
+        try:
+            centers.append(int(ln))
+        except (TypeError, ValueError):
+            continue
+    for ln in sym.write_lines or []:
+        try:
+            centers.append(int(ln))
+        except (TypeError, ValueError):
+            continue
+    for ln in sym.guard_candidate_lines or []:
+        try:
+            centers.append(int(ln))
+        except (TypeError, ValueError):
+            continue
+    if sym.declaration_line:
+        try:
+            centers.append(int(sym.declaration_line))
+        except (TypeError, ValueError):
+            pass
+    if prep.alarm_line and name in {
+        (prep.array_name or ""),
+        (prep.index_expression or ""),
+    }:
+        centers.append(int(prep.alarm_line))
+
+    # de-dupe centers
+    seen_c: set[int] = set()
+    uniq_centers: list[int] = []
+    for c in centers:
+        if c in seen_c:
+            continue
+        seen_c.add(c)
+        uniq_centers.append(c)
+
+    windows = _merge_line_windows(uniq_centers, radius=radius)
+    chunks: list[str] = []
+    window_meta: list[dict[str, Any]] = []
+    for start, end in windows:
+        rows = source.get_lines(start, end)
+        if not rows:
+            continue
+        text = "\n".join(f"{ln}: {txt}" for ln, txt in rows)
+        chunks.append(text)
+        window_meta.append(
+            {
+                "start": start,
+                "end": end,
+                "function": source.enclosing_function(start) or source.enclosing_function(end),
+                "line_count": len(rows),
+            }
+        )
+
+    primary = funcs[0] if funcs else (prep.enclosing_function or "")
+    return {
+        "symbol": name,
+        "role": sym.role,
+        "kind": sym.kind,
+        "functions": funcs,
+        "primary_function": primary,
+        "key_lines": uniq_centers,
+        "windows": window_meta,
+        "window_radius": radius,
+        "package_text": "\n\n".join(chunks)[:24000],
+        "declaration_line": sym.declaration_line,
+        "declaration_text": (sym.declaration_text or "")[:240],
+    }
+
+
 def var_value_sequence(prep: PrepPack, source: SourceIndex, *, cap: int | None = None) -> list[str]:
-    """Visit list covering EVERY dataflow symbol's functions + value origins.
+    """Legacy function visit list (call-path-adjacent). Prefer symbol packages for VAR_VALUE.
 
-    Includes:
-    - enclosing function
-    - value-origin callees (``idx = Fn(...)``)
-    - each symbol's ``function_sequence`` / used_in (dataflow list)
-    - write / declaration enclosing functions
-    - full call-path sequence when index is not purely local
-
-    Cap defaults to ``AOOB_VAR_SEQUENCE_CAP`` (24) so large alarms stay bounded
-    but multi-symbol dataflow is not truncated to 8.
+    Kept for tests / fallbacks. Includes every dataflow symbol's functions.
     """
     import os
 
@@ -233,7 +345,6 @@ def var_value_sequence(prep: PrepPack, source: SourceIndex, *, cap: int | None =
     for name in prep.value_origin_callees:
         add(name)
 
-    # All symbols from the alarm dataflow list — declaration + used_in chains
     for sym in prep.symbols:
         for name in sym.function_sequence or []:
             add(name)

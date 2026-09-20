@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from aoob_pipeline.explore_support import (
+    build_symbol_package,
     compact_explore_pack,
     dataflow_symbol_paths,
     mine_facts_from_body,
@@ -341,3 +342,18 @@ def test_multi_symbol_var_sequence_and_compact_pack(tmp_path: Path) -> None:
     assert len(compact.facts) <= 8
     assert all(f.kind != "access" for f in compact.facts)  # access not in call allowlist
     assert any(f.kind == "declaration" for f in compact.facts)
+
+
+def test_symbol_package_uses_pm3_windows(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    prep = build_prep(pver_id="t", order="7", alarm=_alarm(), source=source)
+    sym = next(s for s in prep.symbols if s.symbol_name == "numClass")
+    pkg = build_symbol_package(sym, prep, source, radius=3)
+    assert pkg["symbol"] == "numClass"
+    assert pkg["primary_function"]
+    assert pkg["windows"], "expected merged ±3 windows around key lines"
+    for win in pkg["windows"]:
+        assert win["end"] - win["start"] >= 0
+        # each window spans at most the merged centers ±3, but at least one line
+        assert win["line_count"] >= 1
+    assert ":" in pkg["package_text"]  # numbered CITE lines

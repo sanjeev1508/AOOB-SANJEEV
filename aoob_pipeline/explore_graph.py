@@ -14,6 +14,7 @@ from langgraph.prebuilt import ToolNode
 from aoob_pipeline import prompts
 from aoob_pipeline.events import EventBus, preview_json
 from aoob_pipeline.explore_support import (
+    build_symbol_package,
     call_path_edges,
     call_path_sequence,
     compact_explore_pack,
@@ -423,6 +424,7 @@ def _run_explore_code_driven(
     for step_i, name in enumerate(sequence, start=1):
         body = source.get_func(name, near_line=prep.alarm_line if name == prep.enclosing_function else None)
         opened.append(name)
+        prev_name = sequence[step_i - 2] if step_i > 1 else None
         if bus:
             bus.emit(
                 "tool_result",
@@ -436,6 +438,7 @@ def _run_explore_code_driven(
                 activity=f"opened {name} ({step_i}/{len(sequence)})",
                 cursor={
                     "current": name,
+                    "prev": prev_name,
                     "index": step_i,
                     "total": len(sequence),
                     "sequence": sequence,
@@ -537,7 +540,7 @@ def _run_explore_code_driven(
             "agent_output",
             agent=agent,
             stage="explore",
-            title=f"Output ← {agent}",
+            title=f"{agent} done — returned explore pack",
             output_preview=preview_json(
                 {
                     "agent": pack.agent,
@@ -548,9 +551,10 @@ def _run_explore_code_driven(
             ),
             functions=opened,
             edges=seq_edges,
-            activity=f"produced {len(pack.facts)} facts (code-driven, compacted)",
+            activity=f"done · {len(pack.facts)} facts (code-driven, compacted)",
             cursor={
                 "current": opened[-1] if opened else None,
+                "prev": opened[-2] if len(opened) > 1 else None,
                 "index": len(opened),
                 "total": len(sequence),
                 "sequence": sequence,
@@ -770,6 +774,237 @@ def run_call_path_explore(
     )
 
 
+def _run_var_symbol_driven(
+    *,
+    prep: PrepPack,
+    source: SourceIndex,
+    focus: str | None,
+    bus: EventBus | None,
+) -> ExplorePack:
+    """Visit each dataflow symbol once; LLM extracts from ±3 window packages."""
+    agent = "VAR_VALUE_EXPLORE"
+    seeds = seed_facts(prep, source)
+    symbols = [s for s in prep.symbols if (s.symbol_name or "").strip()]
+    sym_names = [s.symbol_name for s in symbols]
+    symbol_paths = dataflow_symbol_paths(prep)
+    packages = [build_symbol_package(s, prep, source, radius=3) for s in symbols]
+    # Marker hops: primary function of each symbol (symbol→symbol travel)
+    hop_funcs = [str(p.get("primary_function") or prep.enclosing_function or "") for p in packages]
+    hop_edges = [
+        {"s": hop_funcs[i], "t": hop_funcs[i + 1], "kind": "symbol_hop"}
+        for i in range(len(hop_funcs) - 1)
+        if hop_funcs[i] and hop_funcs[i + 1]
+    ]
+
+    brief = {
+        "role": "var_value",
+        "mode": "symbol_driven",
+        "order": prep.order,
+        "location": prep.location,
+        "enclosing_function": prep.enclosing_function,
+        "alarm_line": prep.alarm_line,
+        "index_expression": prep.index_expression,
+        "array_name": prep.array_name,
+        "array_size": prep.array_size,
+        "symbols": sym_names,
+        "symbol_paths": symbol_paths,
+        "visit_instructions": [
+            "Symbols are visited one at a time (not function-to-function).",
+            "Each package merges ±3 line windows around that symbol's dataflow lines.",
+            "Return ONLY facts about the current symbol.",
+        ],
+    }
+    if focus:
+        brief["reexplore_focus"] = focus
+
+    first_fn = hop_funcs[0] if hop_funcs else prep.enclosing_function
+    if bus:
+        bus.emit(
+            "agent_input",
+            agent=agent,
+            stage="explore",
+            title=f"Input → {agent} (symbol-driven)",
+            input_preview=preview_json(brief),
+            functions=[first_fn] if first_fn else [],
+            edges=hop_edges,
+            activity=f"symbol-by-symbol · {len(symbols)} symbols · ±3 windows",
+            cursor={
+                "current": first_fn,
+                "prev": None,
+                "index": 1 if symbols else 0,
+                "total": len(symbols),
+                "sequence": hop_funcs,
+                "symbols": sym_names,
+                "current_symbol": sym_names[0] if sym_names else None,
+            },
+            var_paths=symbol_paths,
+        )
+
+    extract_system = prompts.code_driven_extract_prompt("var_value")
+    relevant = relevance_tokens(prep, hop_funcs)
+    all_facts: list[Fact] = list(seeds)
+    notes = ["explore_mode=symbol_driven", "window_radius=±3"]
+    dropped_llm = 0
+    covered: list[str] = []
+    prev_fn: str | None = None
+
+    for step_i, (sym, package) in enumerate(zip(symbols, packages), start=1):
+        name = sym.symbol_name
+        primary = str(package.get("primary_function") or "")
+        covered.append(name)
+        if bus:
+            bus.emit(
+                "tool_result",
+                agent=agent,
+                stage="explore",
+                title=f"{agent} ← symbol_package({name})",
+                tool="symbol_package",
+                output_preview=str(package.get("package_text") or "")[:1200],
+                functions=[primary] if primary else [],
+                edges=hop_edges,
+                activity=f"symbol {name} ({step_i}/{len(symbols)}) · windows={len(package.get('windows') or [])}",
+                cursor={
+                    "current": primary or None,
+                    "prev": prev_fn,
+                    "index": step_i,
+                    "total": len(symbols),
+                    "sequence": hop_funcs,
+                    "symbols": sym_names,
+                    "current_symbol": name,
+                },
+                var_paths=symbol_paths,
+            )
+
+        # Deterministic mining on each function that touches this symbol
+        for fn in package.get("functions") or []:
+            body = source.get_func(
+                fn,
+                near_line=prep.alarm_line if fn == prep.enclosing_function else None,
+            )
+            for f in mine_facts_from_body(agent=agent, function=fn, body=body, prep=prep):
+                if f.symbol and f.symbol != name and f.kind not in {"alarm_site", "array_size_hint"}:
+                    # keep only facts for this symbol (plus size/alarm)
+                    if name not in (f.quote or "") and name not in (f.note or ""):
+                        continue
+                all_facts.append(f.model_copy(update={"symbol": f.symbol or name}))
+
+        pkg_text = str(package.get("package_text") or "")
+        if not pkg_text.strip():
+            notes.append(f"empty_package@{name}")
+            prev_fn = primary or prev_fn
+            continue
+
+        if bus:
+            bus.emit(
+                "agent_thinking",
+                agent=agent,
+                stage="explore",
+                title=f"{agent} extract @ symbol {name}",
+                activity="JSON fact extract on ±3 window package (no tools)",
+                functions=[primary] if primary else [],
+                cursor={
+                    "current": primary or None,
+                    "prev": prev_fn,
+                    "index": step_i,
+                    "total": len(symbols),
+                    "sequence": hop_funcs,
+                    "symbols": sym_names,
+                    "current_symbol": name,
+                },
+            )
+
+        human = (
+            f"current_symbol={name}\nrole=var_value\n"
+            f"functions={package.get('functions')}\n"
+            f"key_lines={package.get('key_lines')}\n"
+            f"windows={package.get('windows')}\n"
+            f"index_expression={prep.index_expression}\n"
+            f"array={prep.array_name}\narray_size={prep.array_size}\n"
+            f"alarm_line={prep.alarm_line}\n"
+            f"PACKAGE (±3 merged windows; quote ONLY from these CITE lines):\n{pkg_text[:16000]}"
+        )
+        try:
+            llm = build_agent_llm(agent, prompt_chars=len(extract_system) + len(human))
+            msg = llm.invoke(
+                [SystemMessage(content=extract_system), HumanMessage(content=human)]
+            )
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            for item in _extract_json_list(content):
+                # Force symbol tag to current
+                if isinstance(item, dict) and not item.get("symbol"):
+                    item = {**item, "symbol": name}
+                fn_hint = primary or prep.enclosing_function or ""
+                fact = normalize_llm_fact(
+                    item, function=fn_hint, prep=prep, source=source, relevant=relevant
+                )
+                if fact is None:
+                    dropped_llm += 1
+                    continue
+                if not fact.symbol:
+                    fact = fact.model_copy(update={"symbol": name})
+                all_facts.append(fact)
+        except Exception as exc:  # noqa: BLE001
+            notes.append(f"extract_failed@{name}:{exc}")
+
+        prev_fn = primary or prev_fn
+
+    if dropped_llm:
+        notes.append(f"dropped {dropped_llm} irrelevant/unverifiable LLM facts")
+
+    seen: set[tuple] = set()
+    deduped: list[Fact] = []
+    for f in all_facts:
+        key = (f.function, f.line, f.kind, f.quote[:100], f.symbol or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(f)
+
+    pack = compact_explore_pack(
+        ExplorePack(
+            agent=agent,
+            facts=deduped,
+            notes=[
+                *notes,
+                f"symbols_covered={covered}",
+                f"seeded {len(seeds)} deterministic facts",
+            ],
+        ),
+        role="var_value",
+    )
+    if bus:
+        bus.emit(
+            "agent_output",
+            agent=agent,
+            stage="explore",
+            title=f"{agent} done — returned explore pack",
+            output_preview=preview_json(
+                {
+                    "agent": pack.agent,
+                    "fact_count": len(pack.facts),
+                    "facts": [f.model_dump() for f in pack.facts[:30]],
+                    "notes": pack.notes,
+                    "symbols_covered": covered,
+                }
+            ),
+            functions=hop_funcs,
+            edges=hop_edges,
+            activity=f"done · {len(pack.facts)} facts · {len(covered)} symbols",
+            cursor={
+                "current": hop_funcs[-1] if hop_funcs else None,
+                "prev": hop_funcs[-2] if len(hop_funcs) > 1 else None,
+                "index": len(symbols),
+                "total": len(symbols),
+                "sequence": hop_funcs,
+                "symbols": sym_names,
+                "current_symbol": sym_names[-1] if sym_names else None,
+                "done": True,
+            },
+            var_paths=symbol_paths,
+        )
+    return pack
+
+
 def run_var_value_explore(
     prep: PrepPack,
     source: SourceIndex,
@@ -778,14 +1013,6 @@ def run_var_value_explore(
     focus: str | None = None,
     bus: EventBus | None = None,
 ) -> ExplorePack:
-    return _run_explore(
-        agent="VAR_VALUE_EXPLORE",
-        system=prompts.VAR_VALUE_EXPLORE,
-        role="var_value",
-        prep=prep,
-        source=source,
-        sequence=var_value_sequence(prep, source),
-        max_rounds=max_rounds,
-        focus=focus,
-        bus=bus,
-    )
+    """Symbol-by-symbol VAR explore (dataflow packages with ±3 windows)."""
+    _ = max_rounds  # retained for API compatibility with call_path explore
+    return _run_var_symbol_driven(prep=prep, source=source, focus=focus, bus=bus)

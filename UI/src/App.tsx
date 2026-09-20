@@ -459,17 +459,18 @@ function AgentChat({
   onFocusChange?: (focus: AgentFocus | null) => void;
 }) {
   type ChatItem =
-    | { role: "system" | "user" | "assistant"; text: string; kind?: undefined }
-    | { role: "event"; text: string; kind: string; preview?: string };
+    | { role: "system" | "user" | "assistant"; text: string; kind?: undefined; preview?: undefined; open?: undefined }
+    | { role: "event"; text: string; kind: string; preview?: string; open?: boolean };
 
   const [messages, setMessages] = useState<ChatItem[]>([
     {
       role: "system",
-      text: "Live triage stream: prep → explorers (tools) → merge → TP/FP → final. Open an alarm, switch to single PVER to watch the graph, then Classify.",
+      text: "Live triage stream: prep → explorers → merge → TP/FP → final. Expand this panel to read agent returns. Open an alarm, watch FullGraph markers, then Classify.",
     },
   ]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [panel, setPanel] = useState<"expanded" | "normal" | "collapsed">("expanded");
   const logRef = useRef<HTMLDivElement>(null);
   const seenEvents = useRef(0);
 
@@ -508,11 +509,13 @@ function AgentChat({
           ...current,
           ...fresh.map((event) => {
             const preview = event.input_preview || event.output_preview || event.detail || undefined;
+            const isDone = event.kind === "agent_output" || (event.title || "").toLowerCase().includes("done");
             return {
               role: "event" as const,
               kind: event.kind,
               text: formatEvent(event),
               preview: preview || undefined,
+              open: Boolean(isDone && preview),
             };
           }),
         ]);
@@ -543,9 +546,13 @@ function AgentChat({
   const classify = async () => {
     if (!pver || !alarm) return;
     setBusy(true);
+    setPanel("expanded");
     onFocusChange?.({ agent: "orchestrator", activity: "starting pipeline", functions: [] });
     push({ role: "user", text: `Classify alarm order ${alarm}` });
-    push({ role: "assistant", text: "Streaming LangGraph pipeline…" });
+    push({
+      role: "assistant",
+      text: "Starting LangGraph pipeline…\n1) CALL_PATH_EXPLORE + VAR_VALUE_EXPLORE run first\n2) Their returned packs are shown here when done\n3) Then TP_PROVE + FP_PROVE start",
+    });
     try {
       await api(`/api/pvers/${encodeURIComponent(pver)}/alarms/${encodeURIComponent(alarm)}/classify`, {
         method: "POST",
@@ -576,41 +583,82 @@ function AgentChat({
     setDraft("");
   };
 
+  const togglePreview = (index: number) => {
+    setMessages((current) =>
+      current.map((item, i) =>
+        i === index && item.role === "event" ? { ...item, open: !item.open } : item,
+      ),
+    );
+  };
+
   return (
-    <aside className="agent-chat">
+    <aside className={`agent-chat ${panel}`}>
       <div className="sidebar-heading">
         <div>
           <span className="eyebrow">agent</span>
           <h1>{pver || "workspace"}</h1>
         </div>
-        <span className="count-pill">{mode}{alarm ? ` · ${alarm}` : ""}</span>
-      </div>
-      <div className="chat-log" ref={logRef}>
-        {messages.map((item, index) => (
-          <article
-            className={`chat-bubble ${item.role}${item.role === "event" ? ` event ${item.kind}` : ""}`}
-            key={`${item.role}-${index}`}
-          >
-            <span>{item.role === "event" ? item.kind : item.role}</span>
-            <p style={{ whiteSpace: "pre-wrap" }}>{item.text}</p>
-            {"preview" in item && item.preview ? <pre>{item.preview}</pre> : null}
-          </article>
-        ))}
-      </div>
-      <div className="chat-input" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-        <button type="button" disabled={!pver || !alarm || busy} onClick={() => void classify()}>
-          {busy ? "Streaming…" : "Classify alarm"}
+        {panel !== "collapsed" ? (
+          <span className="count-pill">{mode}{alarm ? ` · ${alarm}` : ""}</span>
+        ) : null}
+        <button
+          type="button"
+          className="agent-expand-btn"
+          onClick={() =>
+            setPanel((current) =>
+              current === "expanded" ? "normal" : current === "normal" ? "collapsed" : "expanded",
+            )
+          }
+        >
+          {panel === "expanded" ? "shrink" : panel === "normal" ? "hide" : "show"}
         </button>
       </div>
-      <form className="chat-input" onSubmit={send}>
-        <input
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          placeholder="notes for this PVER or alarm…"
-          disabled={!pver}
-        />
-        <button type="submit" disabled={!pver || !draft.trim()}>Send</button>
-      </form>
+      {panel !== "collapsed" ? (
+        <>
+          <div className="chat-log" ref={logRef}>
+            {messages.map((item, index) => (
+              <article
+                className={`chat-bubble ${item.role}${item.role === "event" ? ` event ${item.kind}` : ""}`}
+                key={`${item.role}-${index}`}
+              >
+                <span>
+                  {item.role === "event" ? item.kind : item.role}
+                  {item.role === "event" && item.kind === "agent_output" ? (
+                    <em className="done-badge">done · output</em>
+                  ) : null}
+                </span>
+                <p style={{ whiteSpace: "pre-wrap" }}>{item.text}</p>
+                {"preview" in item && item.preview ? (
+                  <>
+                    <button
+                      type="button"
+                      className="chat-preview-toggle"
+                      onClick={() => togglePreview(index)}
+                    >
+                      {item.open ? "collapse output ▴" : "expand output ▾"}
+                    </button>
+                    <pre className={item.open ? "expanded-preview" : "collapsed-preview"}>{item.preview}</pre>
+                  </>
+                ) : null}
+              </article>
+            ))}
+          </div>
+          <div className="chat-input" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
+            <button type="button" disabled={!pver || !alarm || busy} onClick={() => void classify()}>
+              {busy ? "Streaming…" : "Classify alarm"}
+            </button>
+          </div>
+          <form className="chat-input" onSubmit={send}>
+            <input
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="notes for this PVER or alarm…"
+              disabled={!pver}
+            />
+            <button type="submit" disabled={!pver || !draft.trim()}>Send</button>
+          </form>
+        </>
+      ) : null}
     </aside>
   );
 }

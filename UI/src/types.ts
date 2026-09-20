@@ -192,10 +192,12 @@ export type CfgResponse = {
 
 export type AgentCursor = {
   current?: string | null;
+  prev?: string | null;
   index?: number;
   total?: number;
   sequence?: string[];
   symbols?: string[];
+  current_symbol?: string | null;
   done?: boolean;
 };
 
