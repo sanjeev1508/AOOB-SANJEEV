@@ -1,0 +1,1931 @@
+# AOOB-9-9
+
+Astree array-out-of-bounds (AOOB) enrichment, graph exploration, and
+multi-agent triage for automotive preprocessed C projects.
+
+Each analysis unit is a **PVER** folder with a fixed file layout. The
+**analyzer** enriches alarms with symbol facts and a caller–callee CFG. The
+**UI** browses one alarm or the whole PVER graph. The **agent pipeline**
+(`aoob_pipeline/`) classifies alarms as TP / FP / uncertain under a
+never-miss-TP policy.
+
+For the full implemented design (detailed diagrams, schemas, APIs, feature inventory), see **[IMPLEMENTATION.md](IMPLEMENTATION.md)**.
+
+`PVERs/4105` and `PVERs/5901` are samples only. Any folder that follows the
+same contract must work the same way.
+
+---
+
+## High-level architecture
+
+```text
+┌─────────────┐     ┌──────────────────┐     ┌────────────────────────────┐
+│ Astree CSV  │     │ array_oob_       │     │ UI (React + FastAPI)       │
+│ messeges.txt│────▶│ analyzer.py      │────▶│  single alarm / PVER graph │
+│ input.c     │     │                  │     │  Classify → live stream    │
+└─────────────┘     └────────┬─────────┘     └─────────────▲──────────────┘
+                             │                             │
+                             ▼                             │
+                    PVERs/<id>/                            │
+                      array_oob_variable_info.json         │
+                      full_control_flow_graph.json         │
+                      input.c                              │
+                             │                             │
+                             ▼                             │
+                    ┌──────────────────┐                   │
+                    │ aoob_pipeline/   │───────────────────┘
+                    │ prep → explore → │  EventBus + agent_runs/
+                    │ merge → prove →  │
+                    │ validate → final │
+                    └──────────────────┘
+```
+
+Two products share one PVER:
+
+| Layer | Purpose | Required? |
+|-------|---------|-----------|
+| Analyzer | Symbols, paths, CFG JSON | Yes for UI + agents |
+| Explorer UI | Browse alarms / graphs | Optional |
+| Agent triage | Classify one alarm (TP/FP/uncertain) | Optional |
+
+---
+
+## Repository layout
+
+```text
+AOOB-9-9/
+├── array_oob_analyzer.py          # CLI analyzer (symbols + CFG)
+├── aoob_pipeline/                 # LangGraph multi-agent triage
+│   ├── orchestrator.py            # prep → explore → prove → deterministic gates
+│   ├── prep.py                    # deterministic skeletons + size recovery
+│   ├── explore_graph.py           # CALL_PATH + VAR_VALUE explorers
+│   ├── explore_support.py         # sequences, seeds, body mining
+│   ├── pseudocode.py              # C to PSEUDO+CITE for LLM context
+│   ├── tools.py / session.py      # move/get visit cursor + tools
+│   ├── merge.py / validate.py     # packs + quote scrubbing
+│   ├── prove_graph.py             # TP_PROVE + FP_PROVE (no tools)
+│   ├── final_graph.py             # deterministic gates; optional LLM disabled by default
+│   ├── policy.py                  # ironclad FP gates
+│   ├── llm.py / config.py         # per-agent backends from .env
+│   ├── events.py / artifacts.py   # live stream + run folders
+│   ├── schemas.py / prompts.py
+│   └── tests/
+├── PVERs/
+│   └── <id>/                      # one folder per PVER
+│       ├── Full_alarms.csv
+│       ├── input.c
+│       ├── messeges.txt           # optional but preferred
+│       ├── array_oob_variable_info.json
+│       ├── full_control_flow_graph.json
+│       └── agent_runs/<order>/<timestamp>/   # triage artifacts
+├── UI/
+│   ├── src/                       # Vite React frontend
+│   └── backend/                   # FastAPI (explorer + classify APIs)
+├── requirements.txt
+├── .env                           # per-agent LLM backends (gitignored)
+└── README.md
+```
+
+---
+
+## PVER folder contract
+
+| File | Role |
+|------|------|
+| `Full_alarms.csv` | Astree export (`Order`, `Location`, optional `Message`) |
+| `input.c` | Preprocessed source; **same line numbers as Astree** |
+| `messeges.txt` | Optional. Full call stacks per AOOB alarm (many paths per location) |
+| `array_oob_variable_info.json` | Analyzer output: alarms, symbols, occurrences, paths |
+| `full_control_flow_graph.json` | Analyzer CFG: `{ caller: [callee, ...] }` for every function |
+
+Notes:
+
+- CSV alone has **one row per alarm** and **no call stacks**. Path multiplicity
+  comes from `messeges.txt` (merged by location when the analyzer runs on CSV).
+- The **full PVER graph** in the UI is built **only** from that folder’s
+  `full_control_flow_graph.json` — never from another PVER’s files.
+- UI / pipeline alarm lookup uses Astree **Order** (e.g. `2,475`). Internally
+  the JSON may use `group_id`; resolution joins via **Location** when needed.
+
+---
+
+## Analyzer (`array_oob_analyzer.py`)
+
+```powershell
+# Full enrich + CFG into the paths you pass (usually inside PVERs/<id>/)
+python array_oob_analyzer.py <alarms.csv|messeges.txt> <input.c> <array_oob_variable_info.json> [cfg.json]
+
+# CFG only
+python array_oob_analyzer.py --cfg-only <input.c> <full_control_flow_graph.json>
+
+# Attach / refresh Astree stacks into an existing variable-info JSON
+python array_oob_analyzer.py --merge-paths <array_oob_variable_info.json> [messeges.txt]
+```
+
+What it produces per alarm group:
+
+- Flagged array / index / parent symbols (not every identifier on the line)
+- Kind, scope, dims/size when known, declaration, access counts
+- Occurrences with line, function, access mode
+- `paths[]` from the message log when available (`no_of_paths`, `no_of_traces`)
+- Sibling CFG JSON: closed caller-to-callee map (defined functions, prototypes, callees)
+
+---
+
+## Explorer UI
+
+### Modes
+
+| Mode | Content |
+|------|---------|
+| **Single alarm** | Alarm header; **control flow** (merged unique Astree paths); **data flow** (variables and occurrences, CFG-ordered functions, read-access filter) |
+| **Single PVER** | Full graph from CFG JSON; path highlight from the searched alarm; right-hand variable / function list |
+
+Shared chrome: PVER picker, mode toggle, top alarm-order search, left **agent chat**
+(live triage stream), orange **agent focus** overlay on the graph while Classify runs.
+
+### Control-flow / graph filters
+
+- **Show all unique paths** — every distinct Astree function sequence
+- **Paths with selected variable** — only paths that touch a function where the
+  current data-flow variable is present
+
+PVER graph also has: show all node labels, show all edges, click node to
+expand/collapse callees.
+
+### Run locally
+
+Backend (`UI/backend`):
+
+```powershell
+python -m pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+Frontend (`UI`):
+
+```powershell
+npm install
+npm run dev
+```
+
+Vite proxies `/api` to `http://127.0.0.1:8000`.
+
+### Main API surface
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/pvers` | List PVER folders and readiness |
+| POST | `/api/pvers/{id}/open` | Activate folder (build if CFG missing) |
+| GET | `/api/pvers/{id}/status` | Poll analyzer job |
+| GET | `/api/alarms` | Alarm list for active PVER |
+| GET | `/api/alarm?order=` / `/api/alarm/{order}` | Alarm detail + `graph_highlight` |
+| GET | `/api/graph` | Layout payload from that PVER’s CFG JSON |
+| GET | `/api/cfg` / `summary` / `neighborhood` / `search` | CFG helpers |
+| POST | `/api/pvers/{id}/alarms/{order}/classify` | Start agent triage (async) |
+| GET | `/api/pvers/{id}/alarms/{order}/classify` | Poll status + streamed events |
+| GET | `/api/health` | Liveness |
+
+### Data flow ordering (UI)
+
+Function lists in both modes are ordered using the control-flow graph:
+
+1. **declaration** (global)
+2. **intermediate** callers before callees
+3. **leaf** — alarm / enclosing function last
+
+Optional filters: **all** / **with read access** / **without read access**.
+
+---
+
+## Agent triage pipeline
+
+LangGraph multi-agent classification lives in `aoob_pipeline/`. It is **not**
+required for the explorer UI alone. From the UI: open an alarm → **Classify alarm**.
+From the CLI:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m aoob_pipeline --pver 4105 --order 2475
+# or Order as shown in Astree / UI:
+python -m aoob_pipeline --pver 4105 --order "2,475"
+# lower VRAM (explore/prove sequential):
+python -m aoob_pipeline --pver 4105 --order 2475 --sequential
+# --fast only affects the optional final LLM if it is re-enabled:
+python -m aoob_pipeline --pver 4105 --order 2475 --fast
+```
+
+To run the pipeline for every `Order` in one selected PVER and write a
+per-order conversation and human-label comparison to XML:
+
+```powershell
+python run_pver_pipeline.py --pver 4105
+# Lower VRAM use:
+python run_pver_pipeline.py --pver 4105 --sequential
+# Fast final LLM vote (currently disabled by default):
+python run_pver_pipeline.py --pver 4105 --fast
+# Use another human-label column or choose a report destination:
+python run_pver_pipeline.py --pver 4105 --truth-column Classification --output reports\4105.xml
+```
+
+Final classification currently uses deterministic evidence gates only. The
+`FINAL_CLASSIFICATION` LLM call is disabled by default in
+`aoob_pipeline/final_graph.py` (`FINAL_CLASSIFIER_LLM_ENABLED = False`); set
+`AOOB_FINAL_LLM=1` (or the constant to `True`) to restore LLM voting and its
+re-explore requests. Until then, `--fast` does not invoke a final model.
+
+The gates are, in order: a validated TP witness from TP_PROVE, then a
+deterministic TP witness from `range_evidence.py` (an unbounded increment of
+the index), then a deterministic range proof on every path class, and finally
+the ironclad FP checklist. Anything else is `uncertain`.
+
+### Scoring against expert labels
+
+`eval_labels.py` scores the pipeline against a human-labelled CSV such as
+`PVERs/4105/Full_alarms_with_result.csv`. It is the only code that reads that
+file: the pipeline and UI skip any `*result*.csv`.
+
+```powershell
+# deterministic stages only (prep + range evidence, no LLM, ~10 min for 609 alarms)
+python eval_labels.py --pver 4105 --mode deterministic --json $env:TEMP\det.json
+# score existing agent_runs/*/result.json
+python eval_labels.py --pver 4105 --mode runs
+# run the full pipeline on selected orders
+python eval_labels.py --pver 4105 --mode pipeline --orders "2,475" "3,113" --sequential
+```
+
+It reports wrong FPs (expert TP labelled FP, the critical error), wrong TPs,
+recall per label, and the uncertain count, split by human-reviewed and
+tool-labelled rows (`ALG TOOL` comments). Use `--sequential` separately if Ollama reports
+VRAM/resource failures; that limits concurrent agents but may increase
+wall-clock time.
+
+The full PVER runner (`run_pver_pipeline.py`) writes
+`PVERs/<id>/agentic_report.xml` and refreshes it after each finished order.
+The XML holds the confusion matrix, prediction counts, per-order wall time,
+`<llm_usage>` (API calls / tokens when the backend reports them), prediction,
+human label, match flag, and the raw agent conversation events. Blank or
+unrecognized human labels are marked unknown and excluded from the matrix.
+`true`/`TP` normalize to TP; `false`/`FP` normalize to FP.
+
+Beside the XML, the pipeline writes a compact **`agentic_report.html`**
+(`pver_report_to_md.convert_html`). Open that file in a browser. Layout:
+
+1. **Run summary** — status, total time, orders completed/errors, prediction
+   counts, aggregate API calls and tokens
+2. **Confusion matrix** — human label × agent prediction (simple table)
+3. **Expandable alarms** — one row per order; summary shows label, runtime,
+   and API call count. Expanded body shows:
+   - time, status, API calls, input / output / total tokens
+   - human label and match
+   - alarm fields (location, function, array, index, …)
+   - rationale and hard gates when present
+   - nested **LLM agents** (CALL_PATH_EXPLORE, VAR_VALUE_EXPLORE, TP_PROVE,
+     FP_PROVE, FINAL_CLASSIFICATION): each step is **Input / Reasoning /
+     Output** only
+
+Tool dumps, full XML trees, and per-event “all fields” panels are omitted from
+the HTML. Truncated previews saved in the XML are marked; missing characters
+cannot be reconstructed. Regenerate HTML from an existing XML anytime:
+
+```powershell
+python pver_report_to_md.py PVERs\4105\agentic_report.xml
+# Choose an output path or request Markdown instead:
+python pver_report_to_md.py PVERs\4105\agentic_report.xml -o reports\4105.html
+python pver_report_to_md.py PVERs\4105\agentic_report.xml --format markdown
+```
+
+Multiple XML files can be converted in one run; each gets a sibling `.html`
+file by default. The XML remains the machine-readable source.
+
+### End-to-end flow
+
+```text
+  load alarm (Order → Location → group)
+           │
+           ▼
+  ┌──────────────────┐
+  │ 1. PREP          │  deterministic (no LLM)
+  │  path-class      │  collapse Astree paths, local guard scan,
+  │  collapse        │  symbol skeletons, array size / initializer recovery
+  └────────┬─────────┘
+           │
+     ┌─────┴─────┐   (parallel unless --sequential)
+     ▼           ▼
+  CALL_PATH   VAR_VALUE     explorers (LangGraph + tools or code_driven)
+  EXPLORE     EXPLORE
+     │           │
+     └─────┬─────┘
+           ▼
+  ┌──────────────────┐
+  │ 2. MERGE         │  attach facts to path classes; coverage full|partial
+  └────────┬─────────┘
+           │
+     ┌─────┴─────┐
+     ▼           ▼
+  TP_PROVE    FP_PROVE      provers (LLM only, no tools)
+     │           │
+     └─────┬─────┘
+           ▼
+  ┌──────────────────┐
+  │ 3. VALIDATE      │  drop uncited quotes / soft claims
+  └────────┬─────────┘
+           ▼
+  ┌──────────────────┐
+  │ 4. FINAL POLICY  │  deterministic validated-TP / ironclad-FP gates
+  │  LLM disabled    │  otherwise uncertain
+  └────────┬─────────┘
+           │
+           ▼  (LLM re-explore planner only when explicitly re-enabled)
+        re-explore focus → merge → prove → policy again
+           │
+           ▼
+     verdict + result.json
+```
+
+Live events (`stage`, `agent_input`, `agent_thinking`, `agent_output`, `done`)
+are written to `events.jsonl` and streamed into the UI chat / FullGraph overlay.
+The TP/FP provers use JSON-Schema structured output; a reply missing required
+fields is retried and then recorded as a prover failure, not as a safety
+conclusion. Source-derived array sizes remain authoritative. CALL_PATH_EXPLORE
+now follows only analyzer execution paths; VAR_VALUE_EXPLORE separately traces
+index values through helper returns, actual/formal bindings, output parameters,
+and candidate backing-storage writers.
+Complete constant byte-map initializers can produce a verified value range,
+but that range is conditional on separately proving the lookup index is valid;
+mutable runtime table values and unproven index domains remain explicitly
+unknown rather than being inferred from integer types.
+
+### Five agents
+
+| Agent | Role | Tools? |
+|-------|------|--------|
+| **CALL_PATH_EXPLORE** | Follow execution-path functions, conditions, and actual/formal call bindings | Yes (`move_func`, `get_current`, …) or code-driven |
+| **VAR_VALUE_EXPLORE** | Trace index definitions, helper returns, output parameters, and backing-storage writers; report unresolved domains | On demand |
+| **TP_PROVE** | Argue a credible OOB case from the merged pack | No |
+| **FP_PROVE** | Argue the access is safe for all path classes | No |
+| **FINAL_CLASSIFICATION** | Optional LLM vote / re-explore request; disabled by default | No |
+
+Each agent has its own backend/model in `.env`
+(`CALL_PATH_EXPLORE_AGENT`, `*_MODEL`, etc.). Backends: `local` | `network` | `bosch` | `nvidia`. Set `AOOB_LLM_BACKEND=nvidia` to force every agent onto NVIDIA NIM.
+
+### Explore modes (`AOOB_EXPLORE_MODE`)
+
+| Mode | Behavior | When to use |
+|------|----------|-------------|
+| **`code_driven`** (default) | Python walks every required function, opens full bodies, mines quotes; LLM extracts structured facts only | Small models (e.g. 7B) that fail tool-calling |
+| **`tool_agent`** | LLM must call `get_current` / `move_func` / `submit_explore_pack` itself | Strong tool-calling models |
+
+### Pseudocode compression (`AOOB_PSEUDOCODE`, default on)
+
+Before the LLM sees a function body (code-driven extract **or** `get_current`/`get_func`), the pipeline converts C into:
+
+1. **PSEUDO** — lossy but logic-preserving DSL (aliases, `map(state){...}`, buffer copies, collapsed `EMS[0..6]` assigns)
+2. **CITE** — short exact `line: C` rows for verifiable quotes
+
+Deterministic mining and quote verification still use raw C (`raw_snippet`). Set `AOOB_PSEUDOCODE=0` to send full C.
+
+In both explore modes:
+
+- A **visit cursor** requires every function in the sequence to be opened.
+- Deterministic **seed facts** always include array/index declarations and the
+  alarm site line (verified against `input.c`).
+- If the LLM never submits, **force-open + fallback mining** still produces a pack.
+- Prep recovers **array size from initializer element count** when the
+  declaration is `T name[] = { ... }` with no explicit dimension.
+
+### Visit tools (tool_agent mode)
+
+| Tool | Purpose |
+|------|---------|
+| `visit_status` | Current index, opened set, remaining |
+| `move_func` | `next` / `prev` / absolute step (no source) |
+| `get_current` | PSEUDO+CITE for current sequence function; marks visited |
+| `get_func` | Named function PSEUDO+CITE; marks visited if in sequence |
+| `get_lines` | Raw line range (capped) |
+| `submit_explore_pack` | Accept pack only if visit gate passes and facts non-empty |
+
+### Classification policy (never miss TP)
+
+Wrong **FP** is treated as the worst error (hides a real bug). Defaults:
+
+- Prefer **uncertain** or **TP** when evidence is thin.
+- **FP** only when **ironclad** (`AOOB_FP_PRECISION_MODE=strict`):
+  - FP agent claims `fp` with `coverage=full`
+  - Every path class addressed
+  - `array_size=known` and `index_range` not `unknown`
+  - No TP witness; no leftover `missing_evidence`
+  - Bound-related facts present in the merged pack (guard / clamp / size hint / …)
+- When re-enabled, final votes that say `FP` without ironclad evidence are **clamped to uncertain**.
+- Validated TP witness forbids an FP label.
+
+`AOOB_TP_POLICY`:
+
+- `type_legal` — any feasible C witness counts for TP
+- `operating_range` — only realistic operating values
+
+### Pipeline knobs (`.env`)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `AOOB_PATH_CLASS_CAP` | `15` | Max path classes after collapse (`partial` if capped) |
+| `AOOB_FINAL_RUNS` | `3` | Independent final votes when the final LLM is enabled |
+| `AOOB_MAX_TOOL_ROUNDS` | `12` | Explorer LangGraph tool-loop budget |
+| `AOOB_MAX_REEXPLORE` | `1` | Bounded re-explore when the final LLM is enabled |
+| `AOOB_EXPLORE_MODE` | `code_driven` | See above |
+| `AOOB_PSEUDOCODE` | `1` | Compress bodies to PSEUDO+CITE before LLM |
+| `AOOB_FP_PRECISION_MODE` | `strict` | Ironclad FP gate |
+| `AOOB_TP_POLICY` | `type_legal` | Witness policy |
+| `AOOB_OLLAMA_RUNTIME_FALLBACK` | `1` | Fallback if an Ollama agent fails |
+| `AOOB_LLM_BACKEND` | unset | Force every agent onto `local` / `network` / `bosch` / `nvidia` |
+| `NVIDIA_API_KEY` / `NVIDIA_BASE_URL` / `NVIDIA_MODEL` | — | NVIDIA NIM (`API_KEY` / `BASE_URL` / `MODEL_NAME` also work) |
+| `AOOB_MAX_VISIBLE_TOOLS` | `10` | UI/tool listing clamp |
+
+Example agent wiring (illustrative — set models you actually serve):
+
+```env
+# Local / network Ollama
+CALL_PATH_EXPLORE_AGENT=local
+CALL_PATH_EXPLORE_MODEL=qwen2.5-coder:7b
+VAR_VALUE_EXPLORE_AGENT=local
+VAR_VALUE_EXPLORE_MODEL=qwen2.5-coder:7b
+TP_PROVE_AGENT=network
+TP_PROVE_MODEL=qwen3:14b
+FP_PROVE_AGENT=network
+FP_PROVE_MODEL=qwen3:14b
+FINAL_CLASSIFICATION_AGENT=network
+FINAL_CLASSIFICATION_MODEL=gemma4:26b
+AOOB_EXPLORE_MODE=code_driven
+
+# Or force every agent onto NVIDIA NIM (OpenAI-compatible):
+# AOOB_LLM_BACKEND=nvidia
+# NVIDIA_API_KEY=...
+# NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+# NVIDIA_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+```
+
+Do **not** commit real API keys. Prefer local `.env` overrides that stay out of git.
+
+Full-PVER classify (writes XML + HTML after each order):
+
+```powershell
+python run_pver_pipeline.py --pver 4105
+```
+
+### Run artifacts
+
+Each classify writes under:
+
+```text
+PVERs/<id>/agent_runs/<order>/<UTC-timestamp>[-n]/
+  01_prep.json
+  01b_range_evidence.json
+  02_call_path_explore.json
+  02_var_value_explore.json
+  03_merged.json
+  04_tp_prove.json
+  04_fp_prove.json
+  05_validated.json
+  06_final_vote.json
+  result.json
+  events.jsonl
+  (+ 07…11_* if re-explore runs)
+```
+
+### Package map
+
+| Module | Responsibility |
+|--------|----------------|
+| `orchestrator.py` | Stage wiring, parallel prove, re-explore; stage errors → uncertain `result.json` |
+| `prep.py` | Alarm load, path-class collapse, local guard, size recovery, Astrée ranges |
+| `range_evidence.py` | Deterministic index-range analysis: TP witnesses, FP proofs, candidates |
+| `source_index.py` | Line/function spans over `input.c` + quote verify |
+| `explore_graph.py` | Explorer LangGraphs + code_driven path |
+| `explore_support.py` | Sequences, seeds, body mining |
+| `pseudocode.py` | C to PSEUDO+CITE compressor for explorer LLM context |
+| `merge.py` | Combined pack + coverage |
+| `prove_graph.py` | TP/FP LangGraphs |
+| `validate.py` | Drop uncited findings |
+| `final_graph.py` | Multi-run final + policy clamp |
+| `policy.py` | Ironclad FP checks |
+| `events.py` | EventBus for UI stream |
+| `llm.py` / `config.py` | Resolve backends from `.env` |
+
+---
+
+## Configuration summary
+
+| Need | Config |
+|------|--------|
+| Analyzer / UI browse only | No LLM `.env` required |
+| Agent classify | Root `.env` with per-agent `*_AGENT` / `*_MODEL` + Ollama or Bosch URLs |
+| Secrets | `MODEL_FARM_API_KEY` etc. — never commit |
+
+---
+
+## Tests
+
+```powershell
+# Explorer API
+cd UI\backend
+python -m pytest tests/test_api.py -q
+
+# Frontend typecheck
+cd UI
+npx tsc --noEmit -p tsconfig.app.json
+
+# Agent pipeline (no live LLM required for unit tests)
+cd <repo-root>
+python -m pytest aoob_pipeline/tests -q
+```
+
+---
+
+## Typical workflow
+
+1. Drop Astree CSV + `input.c` (+ `messeges.txt`) into `PVERs/<id>/`.
+2. Run the analyzer to produce `array_oob_variable_info.json` and CFG JSON
+   (or open the PVER in the UI and let it build).
+3. Browse in **Single alarm** or **Single PVER**.
+4. Install agent deps, configure `.env`, restart the backend.
+5. Open an alarm → **Classify** → watch prep / explorers / prove / final in chat.
+6. Inspect `agent_runs/.../result.json` for the verdict and evidence trail.
+
+
+
+
+PVER 4105
+Status
+running
+Started
+2026-10-03T12:32:03.726951+00:00
+Generated
+2026-10-03T12:52:07.500418+00:00
+Mode
+standard
+Total time
+20 min 3.8 s
+Orders
+1
+Completed
+1
+Errors
+0
+Predictions
+TP 0, FP 0, uncertain 1
+API calls
+8
+Tokens
+in 39420 / out 41364
+Confusion matrix
+Accuracy: n/a (0 / 0 matched)
+
+Human \ Agent	TP	FP	uncertain
+TP	0	0	0
+FP	0	0	0
+uncertain	0	0	0
+Alarms (1)
+Expand all alarms
+Collapse all alarms
+uncertain Order 39 · 20 min 3.7 s · 8 API calls
+Time
+20 min 3.7 s
+Status
+completed
+API calls
+8
+Input tokens
+39420
+Output tokens
+41364
+Total tokens
+80784
+Human label
+none
+Match
+unknown
+Field	Value
+Location	ALL_bc_with_context.c:331731.56-85
+Function	MoCMemStrtUp_Co_Hndlr
+Alarm line	331731
+Array	MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP
+Index	Mo_Inst_GetCoreIdx(checkword)
+Coverage	full
+Rationale: Uncertain: neither a validated TP witness nor an ironclad FP case was established by the evidence gates.
+
+Hard gates: fp-block: FP agent did not claim fp, fp-block: FP coverage is not full, fp-block: index_range unknown — cannot prove safe bounds
+
+LLM agents (input / reasoning / output)
+CALL_PATH_EXPLORE (9 steps)
+#1 Input → CALL_PATH_EXPLORE (code-driven)
+Input
+{
+  "role": "call_path",
+  "order": "39",
+  "location": "ALL_bc_with_context.c:331731.56-85",
+  "enclosing_function": "MoCMemStrtUp_Co_Hndlr",
+  "alarm_line": 331731,
+  "index_expression": "Mo_Inst_GetCoreIdx(checkword)",
+  "index_origin": "global",
+  "value_origin_callees": [
+    "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+    "MoCEMM_Co_UpdateChkwordCoreTsk"
+  ],
+  "array_name": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+  "array_size": 2,
+  "local_guard": {
+    "found": false,
+    "function": null,
+    "line": null,
+    "quote": null,
+    "note": "no local bound found in alarm function"
+  },
+  "coverage_cap": "full",
+  "function_sequence": [
+    "sams_ALL_main",
+    "task_SAMS_bootup",
+    "Core0_main",
+    "MoCMemStrtUp_Co_Hndlr"
+  ],
+  "visit_instructions": [
+    "Functions are opened for you one at a time (no tools).",
+    "For each body, return ONLY facts about the listed symbols (ALL of them for var_value)."
+  ],
+  "path_classes": [
+    {
+      "class_id": "C1",
+      "sequence": [
+        {
+          "function": "sams_ALL_main",
+          "call_site_line": 600271
+        },
+        {
+          "function": "task_SAMS_bootup",
+          "call_site_line": 600272
+        },
+        {
+          "function": "Core0_main",
+          "call_site_line": 599956
+        },
+        {
+          "function": "MoCMemStrtUp_Co_Hndlr",
+          "call_site_line": 334057
+        }
+      ],
+      "member_path_ids": [
+        1
+      ],
+      "cluster_note": null
+    }
+  ],
+  "edges": [
+    {
+      "caller": "sams_ALL_main",
+      "call_site_line": 600271,
+      "callee": "task_SAMS_bootup",
+      "path_class_id": "C1"
+    },
+    {
+      "caller": "task_SAMS_bootup",
+      "call_site_line": 600272,
+      "callee": "Core0_main",
+      "path_class_id": "C1"
+    },
+    {
+      "caller": "Core0_main",
+      "call_site_line": 599956,
+      "callee": "MoCMemStrtUp_Co_Hndlr",
+      "path_class_id": "C1"
+    }
+  ]
+}
+#2 CALL_PATH_EXPLORE extract @ sams_ALL_main
+Reasoning
+JSON fact extract on pseudocode+cite (no tools)
+#3 CALL_PATH_EXPLORE extract @ task_SAMS_bootup
+Reasoning
+JSON fact extract on pseudocode+cite (no tools)
+#4 CALL_PATH_EXPLORE extract @ Core0_main
+Reasoning
+JSON fact extract on pseudocode+cite (no tools)
+#5 CALL_PATH_EXPLORE extract @ MoCMemStrtUp_Co_Hndlr
+Reasoning
+JSON fact extract on pseudocode+cite (no tools)
+#6 CALL_PATH_EXPLORE done — returned explore pack
+Output
+{
+  "agent": "CALL_PATH_EXPLORE",
+  "fact_count": 3,
+  "facts": [
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "seeded alarm location line",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "global",
+      "line": 278865,
+      "quote": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST *const *const MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[2] = {",
+      "symbol": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+      "symbol": "checkword",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    }
+  ],
+  "notes": [
+    "explore_mode=code_driven",
+    "extract_failed@MoCMemStrtUp_Co_Hndlr:Expecting value: line 104 column 755 (char 8811)",
+    "opened=['sams_ALL_main', 'task_SAMS_bootup', 'Core0_main', 'MoCMemStrtUp_Co_Hndlr']",
+    "seeded 3 deterministic facts",
+    "compacted facts 25→3 for prover brief"
+  ]
+}
+#7 VAR returned → CALL_PATH (Mo_Inst_GetCoreIdx)
+Output
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+  "symbol": "Mo_Inst_GetCoreIdx",
+  "fact_count": 48,
+  "facts": [
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331794,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331806,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "value_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331812,
+      "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined indexed access",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "guard",
+      "function": "MoCMem_Co_ErrHdl_Proc",
+      "line": 508384,
+      "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined guard/bound candidate",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "guard",
+      "function": "MoCMem_Co_ErrHdl_Proc",
+      "line": 508532,
+      "quote": "if (Mo_Inst_G
+… [2608 more chars]
+#8 VAR returned → CALL_PATH (checkword)
+Output
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+  "symbol": "checkword",
+  "fact_count": 27,
+  "facts": [
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331794,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331806,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "value_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331812,
+      "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+      "symbol": "checkword",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined indexed access",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "write",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+      "sym
+… [2800 more chars]
+#9 CALL_PATH_EXPLORE done — returned this output
+Output
+{
+  "agent": "CALL_PATH_EXPLORE",
+  "fact_count": 3,
+  "facts": [
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "seeded alarm location line",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "global",
+      "line": 278865,
+      "quote": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST *const *const MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[2] = {",
+      "symbol": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+      "symbol": "checkword",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    }
+  ],
+  "notes": [
+    "explore_mode=code_driven",
+    "extract_failed@MoCMemStrtUp_Co_Hndlr:Expecting value: line 104 column 755 (char 8811)",
+    "opened=['sams_ALL_main', 'task_SAMS_bootup', 'Core0_main', 'MoCMemStrtUp_Co_Hndlr']",
+    "seeded 3 deterministic facts",
+    "compacted facts 25→3 for prover brief",
+    "on_demand_var_symbols=['Mo_Inst_GetCoreIdx', 'checkword']",
+    "on_demand_var_facts=48"
+  ]
+}
+VAR_VALUE_EXPLORE (7 steps)
+#1 Input → VAR_VALUE_EXPLORE (on-demand for ['Mo_Inst_GetCoreIdx'])
+Input
+{
+  "requested_by": "CALL_PATH_EXPLORE",
+  "symbols": [
+    "Mo_Inst_GetCoreIdx"
+  ],
+  "mode": "on_demand_pm3",
+  "reexplore_focus": null
+}
+#2 VAR_VALUE_EXPLORE extract @ symbol Mo_Inst_GetCoreIdx
+Reasoning
+JSON fact extract on ±3 window package
+#3 VAR_VALUE_EXPLORE done — returning to CALL_PATH_EXPLORE
+Output
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+  "agent": "VAR_VALUE_EXPLORE",
+  "fact_count": 48,
+  "facts": [
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331794,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331806,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "value_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331812,
+      "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined indexed access",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "guard",
+      "function": "MoCMem_Co_ErrHdl_Proc",
+      "line": 508384,
+      "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined guard/bound candidate",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "guard",
+      "function": "MoCMem_Co_ErrHdl_Proc",
+      "line": 508532,
+      "quote": "if (Mo_Inst_Get
+… [11451 more chars]
+#4 Input → VAR_VALUE_EXPLORE (on-demand for ['checkword'])
+Input
+{
+  "requested_by": "CALL_PATH_EXPLORE",
+  "symbols": [
+    "checkword"
+  ],
+  "mode": "on_demand_pm3",
+  "reexplore_focus": null
+}
+#5 VAR_VALUE_EXPLORE extract @ symbol checkword
+Reasoning
+JSON fact extract on ±3 window package
+#6 VAR_VALUE_EXPLORE done — returning to CALL_PATH_EXPLORE
+Output
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+  "agent": "VAR_VALUE_EXPLORE",
+  "fact_count": 27,
+  "facts": [
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331794,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331806,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "value_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331812,
+      "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+      "symbol": "checkword",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined indexed access",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "write",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+   
+… [10180 more chars]
+#7 VAR_VALUE_EXPLORE done — returned to CALL_PATH
+Output
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+  "agent": "VAR_VALUE_EXPLORE",
+  "fact_count": 48,
+  "facts": [
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331794,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "arg_binding",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331806,
+      "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "value_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331812,
+      "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+      "symbol": "checkword",
+      "path_class_id": "C1",
+      "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "declaration",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+      "symbol": "checkword",
+      "path_class_id": null,
+      "note": "seeded from analyzer declaration",
+      "verified": true,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "alarm_site",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+      "path_class_id": null,
+      "note": "mined indexed access",
+      "verified": null,
+      "source_range": null,
+      "source_domain": null
+    },
+    {
+      "kind": "write",
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331725,
+      "quote": "uint32 checkword = (uint32) 0;",
+   
+… [8692 more chars]
+TP_PROVE (3 steps)
+#1 Input → TP_PROVE
+Input
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+ "coverage": "partial",
+ "notes": [
+  "value-origin callees: ['MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st', 'MoCEMM_Co_UpdateChkwordCoreTsk']",
+  "21 facts not tied to a path-class function",
+  "explore incomplete (3 failures): extract_failed@MoCMemStrtUp_Co_Hndlr:Expecting value: line 104 column 755 (char 8811)"
+ ],
+ "prep": {
+  "order": "39",
+  "enclosing_function": "MoCMemStrtUp_Co_Hndlr",
+  "alarm_line": 331731,
+  "index_expression": "Mo_Inst_GetCoreIdx(checkword)",
+  "index_origin": "global",
+  "value_origin_callees": [
+   "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+   "MoCEMM_Co_UpdateChkwordCoreTsk"
+  ],
+  "array_name": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+  "array_size": 2,
+  "array_size_source": "Astrée array index range",
+  "astree_index_range": [
+   0,
+   7
+  ],
+  "astree_class_ranges": {
+   "C1": [
+    0,
+    7
+   ]
+  },
+  "local_guard": {
+   "found": false,
+   "function": null,
+   "line": null,
+   "quote": null,
+   "note": "no local bound found in alarm function"
+  },
+  "path_classes": [
+   {
+    "class_id": "C1",
+    "sequence": [
+     "sams_ALL_main",
+     "task_SAMS_bootup",
+     "Core0_main",
+     "MoCMemStrtUp_Co_Hndlr"
+    ],
+    "members": 1
+   }
+  ]
+ },
+ "range_evidence": {
+  "meaning": "Deterministic interval analysis of every writer of the index (flow-insensitive, guards NOT modelled). proven_in_bounds=true is a sound proof; a resolved range exceeding the size is only an over-approximation. tp_witnesses are increments of the index with no bound check; candidate_witnesses are out-of-range constants whose reachability to the access is unproven.",
+  "verdict_hint": null,
+  "array_size": 2,
+  "classes": [
+   {
+    "class_id": "C1",
+    "index_range": [
+     0,
+     7
+    ],
+    "proven_in_bounds": false,
+    "astree_range": [
+     0,
+     7
+    ],
+    "unknown_reasons": [],
+    "tp_witness_lines": [],
+    "candidate_lines": []
+   }
+  ],
+  "notes": []
+ },
+ "facts": [
+  {
+   "kind": "alarm_site",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331731,
+   "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "seeded alarm location line",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc",
+   "line": 508384,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc",
+   "line": 508532,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc",
+   "line": 508675,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCSCC_Co_GetStMstInstDet___2464",
+   "line": 508984,
+   "quote": "if ( (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc_Ini",
+   "line": 512580,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCSCC_Co_Proc_Ini",
+   "line": 512677,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "value_site",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331812,
+   "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+   "symbol": "checkword",
+   "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "declaration",
+   "function": "global",
+   "line": 278865,
+   "quote": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST *const *const MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[2] = {",
+   "symbol": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+   "note": "seeded from analyzer declaration",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "declaration",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331725,
+   "quote": "uint32 checkword = (uint32) 0;",
+   "symbol": "checkword",
+   "note": "seeded from analyzer declaration",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "range_step",
+   "function": "Mo_Inst_GetCoreIdx",
+   "line": 278882,
+   "quote": "return (uint8)((checkword >> 21UL) & 7UL);",
+   "symbol": null,
+   "note": "[deterministic] Mo_Inst_GetCoreIdx returns (uint8)((checkword >> 21UL) & 7UL)",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "write",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331725,
+   "quote": "uint32 checkword = (uint32) 0;",
+   "symbol": "checkword",
+   "note": "mined index write/assign",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "write",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331812,
+   "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+   "symbol": "checkword",
+   "note": "mined index write/assign",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "arg_binding",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331794,
+   "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+   "symbol": "checkword",
+   "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "arg_binding",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331806,
+   "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+   "symbol": "checkword",
+   "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "access",
+   "function": "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+   "line": 278906,
+   "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined indexed access",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "access",
+   "function": "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+   "line": 278917,
+   "quote": "if ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)0))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "n
+… [12896 more chars]
+#2 TP_PROVE reasoning
+Reasoning
+proving from merged facts (no tools)
+#3 Output ← TP_PROVE
+Output
+{
+  "agent": "TP_PROVE",
+  "claim": "no_credible_case",
+  "index_range": "unknown",
+  "array_size": "known",
+  "witness": "none",
+  "coverage": "partial",
+  "findings": [],
+  "missing_evidence": [
+    "Source range of MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st return value",
+    "Proven bound on Mo_Inst_GetCoreIdx output relative to array size",
+    "Absence of guard limiting core index to <=1"
+  ],
+  "addressed_path_classes": [
+    "C1"
+  ],
+  "unaddressed_path_classes": [],
+  "rationale": "The alarm accesses MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)] where the array size is 2 but Mo_Inst_GetCoreIdx can return 0‑7 (deterministic step returns (uint8)((checkword >> 21UL) & 7UL)). Guards only check for ==0 and do not bound the index to the array bounds. No source‑level fact proves that checkword’s bits 21‑23 are restricted to values that keep the core index within 0‑1, so an out‑of‑bounds witness cannot be confirmed on any path class.",
+  "error": null
+}
+FP_PROVE (3 steps)
+#1 Input → FP_PROVE
+Input
+Preview was truncated when saved to XML; missing characters are not recoverable.
+
+{
+ "coverage": "partial",
+ "notes": [
+  "value-origin callees: ['MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st', 'MoCEMM_Co_UpdateChkwordCoreTsk']",
+  "21 facts not tied to a path-class function",
+  "explore incomplete (3 failures): extract_failed@MoCMemStrtUp_Co_Hndlr:Expecting value: line 104 column 755 (char 8811)"
+ ],
+ "prep": {
+  "order": "39",
+  "enclosing_function": "MoCMemStrtUp_Co_Hndlr",
+  "alarm_line": 331731,
+  "index_expression": "Mo_Inst_GetCoreIdx(checkword)",
+  "index_origin": "global",
+  "value_origin_callees": [
+   "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+   "MoCEMM_Co_UpdateChkwordCoreTsk"
+  ],
+  "array_name": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+  "array_size": 2,
+  "array_size_source": "Astrée array index range",
+  "astree_index_range": [
+   0,
+   7
+  ],
+  "astree_class_ranges": {
+   "C1": [
+    0,
+    7
+   ]
+  },
+  "local_guard": {
+   "found": false,
+   "function": null,
+   "line": null,
+   "quote": null,
+   "note": "no local bound found in alarm function"
+  },
+  "path_classes": [
+   {
+    "class_id": "C1",
+    "sequence": [
+     "sams_ALL_main",
+     "task_SAMS_bootup",
+     "Core0_main",
+     "MoCMemStrtUp_Co_Hndlr"
+    ],
+    "members": 1
+   }
+  ]
+ },
+ "range_evidence": {
+  "meaning": "Deterministic interval analysis of every writer of the index (flow-insensitive, guards NOT modelled). proven_in_bounds=true is a sound proof; a resolved range exceeding the size is only an over-approximation. tp_witnesses are increments of the index with no bound check; candidate_witnesses are out-of-range constants whose reachability to the access is unproven.",
+  "verdict_hint": null,
+  "array_size": 2,
+  "classes": [
+   {
+    "class_id": "C1",
+    "index_range": [
+     0,
+     7
+    ],
+    "proven_in_bounds": false,
+    "astree_range": [
+     0,
+     7
+    ],
+    "unknown_reasons": [],
+    "tp_witness_lines": [],
+    "candidate_lines": []
+   }
+  ],
+  "notes": []
+ },
+ "facts": [
+  {
+   "kind": "alarm_site",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331731,
+   "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "seeded alarm location line",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc",
+   "line": 508384,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc",
+   "line": 508532,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc",
+   "line": 508675,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCSCC_Co_GetStMstInstDet___2464",
+   "line": 508984,
+   "quote": "if ( (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCMem_Co_ErrHdl_Proc_Ini",
+   "line": 512580,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "guard",
+   "function": "MoCSCC_Co_Proc_Ini",
+   "line": 512677,
+   "quote": "if (Mo_Inst_GetCoreIdx(checkword) == (0U))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined guard/bound candidate",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "value_site",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331812,
+   "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+   "symbol": "checkword",
+   "note": "return value from MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st is assigned to checkword; actual/formal input bindings are listed separately",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "declaration",
+   "function": "global",
+   "line": 278865,
+   "quote": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST *const *const MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[2] = {",
+   "symbol": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP",
+   "note": "seeded from analyzer declaration",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "declaration",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331725,
+   "quote": "uint32 checkword = (uint32) 0;",
+   "symbol": "checkword",
+   "note": "seeded from analyzer declaration",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "range_step",
+   "function": "Mo_Inst_GetCoreIdx",
+   "line": 278882,
+   "quote": "return (uint8)((checkword >> 21UL) & 7UL);",
+   "symbol": null,
+   "note": "[deterministic] Mo_Inst_GetCoreIdx returns (uint8)((checkword >> 21UL) & 7UL)",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "write",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331725,
+   "quote": "uint32 checkword = (uint32) 0;",
+   "symbol": "checkword",
+   "note": "mined index write/assign",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "write",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331812,
+   "quote": "checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st();",
+   "symbol": "checkword",
+   "note": "mined index write/assign",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "arg_binding",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331794,
+   "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+   "symbol": "checkword",
+   "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "arg_binding",
+   "function": "MoCMemStrtUp_Co_Hndlr",
+   "line": 331806,
+   "quote": "MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk);",
+   "symbol": "checkword",
+   "note": "MoCEMM_Co_UpdateChkwordCoreTsk parameter chkword receives &checkword; this maps the value flow but does not prove a range",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": "all"
+  },
+  {
+   "kind": "access",
+   "function": "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+   "line": 278906,
+   "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "note": "mined indexed access",
+   "verified": true,
+   "source_range": null,
+   "source_domain": null,
+   "path_classes": []
+  },
+  {
+   "kind": "access",
+   "function": "MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st",
+   "line": 278917,
+   "quote": "if ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)0))",
+   "symbol": "Mo_Inst_GetCoreIdx(checkword)",
+   "n
+… [12896 more chars]
+#2 FP_PROVE reasoning
+Reasoning
+proving from merged facts (no tools)
+#3 Output ← FP_PROVE
+Output
+{
+  "agent": "FP_PROVE",
+  "claim": "no_credible_case",
+  "index_range": "unknown",
+  "array_size": "known",
+  "witness": "none",
+  "coverage": "partial",
+  "findings": [
+    {
+      "function": "MoCMemStrtUp_Co_Hndlr",
+      "line": 331731,
+      "quote": "while ((MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[Mo_Inst_GetCoreIdx(checkword)]) != ((void *)&mo_inst_endPtrVar))",
+      "path_class_id": "C1",
+      "note": "alarm access with index out of possible range"
+    },
+    {
+      "function": "global",
+      "line": 278865,
+      "quote": "MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST *const *const MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP[2] = {",
+      "path_class_id": "C1",
+      "note": "array size known to be 2"
+    },
+    {
+      "function": "Mo_Inst_GetCoreIdx",
+      "line": 278882,
+      "quote": "return (uint8)((checkword >> 21UL) & 7UL);",
+      "path_class_id": "C1",
+      "note": "index always 0-7"
+    }
+  ],
+  "missing_evidence": [
+    "no guard or proven range bounding Mo_Inst_GetCoreIdx result to <2 on any path class"
+  ],
+  "addressed_path_classes": [
+    "C1"
+  ],
+  "unaddressed_path_classes": [],
+  "rationale": "The array MOCMEM_VBLSTRUCTEARLYCLEAREDRAM_MO_INST_LOOKUP has size 2, but Mo_Inst_GetCoreIdx(checkword) can return values 0-7 (as per its deterministic range). No guard or other evidence proves the core index is limited to 0-1 on any path class. Coverage is partial and the index is not guard-bounded, so a credible case for a real bug exists; thus the alarm cannot be auto-closed as FP.",
+  "error": null
+}
+
+
+I read this as a request to diagnose why Order 39 ended `uncertain`. Without the source I can't say which verdict is correct, but the pipeline did not examine the code that decides it.
+
+## What decides this alarm
+
+`Mo_Inst_GetCoreIdx` returns `(checkword >> 21) & 7`, so for any `uint32` it is 0..7, and the array has 2 entries. The alarm is a TP unless bits 21–23 of `checkword` are always 0 or 1 at line 331731. That depends on:
+
+- `checkword = MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st()` (line 331812)
+- `MoCEMM_Co_UpdateChkwordCoreTsk(&checkword, _cntrCore, _cntrTsk)` (lines 331794, 331806)
+
+Neither function body was ever read. Only the call sites were recorded, as `arg_binding` and `value_site` facts that "do not prove a range". Both provers correctly said "unknown", and the policy gates correctly said `uncertain`.
+
+Two things in the source facts are worth checking by hand:
+
+- `checkword` is initialized to 0 at 331725, and every other write (331794, 331806, 331812) is after the alarm line 331731. If 331731 is the first evaluation of that `while`, the index is 0 there. Astree's 0..7 would then come from loop-carried values, so check whether those writes are inside that loop.
+- The core field is probably built from `_cntrCore`. If that counter's loop bound is 2, this is likely an FP.
+
+## Pipeline problems this run exposed
+
+1. **The alarm function's extraction failed.** `extract_failed@MoCMemStrtUp_Co_Hndlr: Expecting value: line 104 column 755 (char 8811)` looks like truncated or malformed JSON, probably from the output token cap, since the run produced 41k output tokens. That is the most important function, and the failure cost you the facts around the loop and writes. Add JSON repair or a retry, split big functions into line windows, and fail the stage loudly rather than continuing with 3 facts.
+2. **Coverage is inconsistent.** The table says `Coverage full` (the prep cap), the provers received `partial`, and the gate says "FP coverage is not full". Report the merged coverage in the header.
+3. **Mined facts are noise.** The guards `Mo_Inst_GetCoreIdx(checkword) == 0U` in `MoCMem_Co_ErrHdl_Proc`, `MoCSCC_*` and similar functions, plus the accesses in `MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st`, are matched by text. They use different local `checkword` variables and are tagged `path_classes: []`. Drop facts from functions outside the path classes and the value-origin callees, or keep them out of the prover pack. They also invite false "guard exists" arguments.
+4. **The explorer compaction lost the important facts.** 48 VAR facts were compacted to 3 for the prover brief, and the remaining facts are mostly the noise above. Compact by relevance (path-class functions and origin callees first) instead of by count.
+5. **`range_evidence` is not informative here.** It copied Astree's 0..7 and reported empty `unknown_reasons` and no witnesses. It should do the following:
+   - Treat the out-param write (`&checkword`) and the return value as writers.
+   - Descend into the two origin callees.
+   - Search for constructors of the field, such as `<< 21UL`, `| (core << 21)` or a `SetCoreIdx` helper.
+   - Bound the source variable (`_cntrCore` loop limit or constants).
+
+   With that, many of these alarms become deterministic proofs or deterministic TP witnesses without any LLM.
+6. **The FP prover output contradicts itself.** `claim: no_credible_case` is paired with a rationale saying "a credible case for a real bug exists". A claim enum like `fp | not_fp | unknown` would be cleaner than two provers both saying "no credible case". Add a consistency check between claim and rationale.
+7. **The call-path exploration was needlessly expensive.** Three of the four functions on the path (`sams_ALL_main`, `task_SAMS_bootup`, `Core0_main`) are pure call chains that cost an LLM call each. Only open path functions that contain guards or writes of the index symbols, and always open the origin callees. The 20 minutes and 80k tokens for an `uncertain` result is mostly this.
+8. **The report has no human label.** The matrix is empty because the label is `none`. Pass `--truth-column`, or score this with `eval_labels.py`. The `Status: running` in the header after completion is also a small report-refresh bug.
+
+## Suggested next step
+
+Add a deterministic stage: "slice backwards from the index through origin callees and out-params, then compute bit-field ranges". For this alarm it should compute the range of `(X >> 21) & 7`, where X comes from the two functions above, rather than fall back to the full 0..7. I can write that stage, or the JSON-repair and retry fix, if you paste `range_evidence.py` and the bodies of `MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st` and `MoCEMM_Co_UpdateChkwordCoreTsk` (lines near 278906–278950 and 331725–331815).
+
+
+
+so list out the full flaws in this pipeline, and do the fixes,, i have attached the pipeline zip
+
+
+
+I'll start by unpacking the zip and reading the code.Those two tests depend on root-level scripts that weren't in the zip, so I'll exclude them and baseline the rest.Now the support module (compaction, mining, relevance, unclear_symbols).Fix 1: robust JSON fact recovery (scan every object for complete fact-like dicts, keep the loud-fail contract when nothing is recoverable).Fix 2: stop silently truncating long function bodies at 16,000 characters (chunk them instead) and retry once on an unparseable extraction reply.Applying the same retry (and a truncation note) to the on-demand VAR extractor:Fix 3: keep guards/writes in the call-path pack, drop mined facts from unrelated functions at merge, and stop unrelated guards from satisfying the FP gate.Fix 4: stop the range analyzer from erasing the "operand unresolved" reasons behind a mask (this is why Order 39 reported `resolved: true, unknown_reasons: []` for `(checkword >> 21) & 7`).Now smaller fixes: coverage visibility in the uncertain rationale, robust env parsing, and prompt semantics for `no_credible_case`.Now tests for each fix, including an orchestrator-level test that proves the deterministic re-explore actually fires.Sanity check: the new tests should fail against the original code (proving they test the bugs, not just my patch).Import failure is expected (new symbols). I'll instead run behavioral probes on the original code for the three bugs that exist there:One suspicious detail from your run: `index_origin: "global"` even though `checkword` is declared as a local in the alarm function. Checking how prep derives it:I found a lot of flaws and fixed most of them in code, but I ran out of tool budget before packaging anything, so you can't download the fixed code yet. It is sitting in my sandbox. If you say "continue", my next turn will run the full suite, check or revert the `prep.py` patch, and hand you a zip, a diff, and `FLAWS.md`.
+
+## What I verified and what I didn't
+
+- **Tests:** 13 new regression tests passed (`tests/test_review_fixes.py`). The existing suite was 110/110 after most of the patches. Two of the later edits (the prose-reply rule and a longer reason string) and the `prep.py` change were not re-run against the full suite.
+- **Not run:** `test_batch_report.py` and `test_pver_report_to_md.py` depend on root scripts that weren't in the zip.
+- **Bugs confirmed on your original code:** I confirmed the first two bugs below by running probes against it. The mask bug and the `index_origin` bug come from reading the code.
+- **Untested change:** I made the `index_origin` fix in `prep.py` as my last action. The regex is clumsy and has never been run, so treat it as unverified until it is tested or reverted.
+- **No live LLM:** I did not test any model calls.
+
+## Flaws fixed
+
+1. **Fact loss on unparseable replies.** A prose-only reply was silently accepted as "no facts". A bad token mid-document discarded every fact in it. I think this is what produced `extract_failed@MoCMemStrtUp_Co_Hndlr`. The parser now recovers any complete fact object anywhere in the reply, and the extractor retries once. It still fails loudly when nothing is recoverable.
+2. **Silent truncation.** Function bodies were cut at 16,000 characters, so writes late in a long function like your alarm handler vanished. Long bodies are now split into overlapping windows, one extraction each, and one failing window no longer discards the others. The VAR package text is still capped but now noted when it is.
+3. **Call-path compaction dropped guards and writes.** Only the `alarm_site` fact survived in my probe, which matches your 25→3. Guards, clamps, masks, loop bounds and writes are now kept.
+4. **Soundness hole in the FP gate.** Facts found by text-matching `Mo_Inst_GetCoreIdx(checkword)` in unrelated functions (a different local `checkword`) were passed to the provers. They also counted as the "a bound exists" evidence in `fp_is_ironclad`. Those facts are now excluded at merge and no longer count.
+5. **The mask erased its own uncertainty.** For `(checkword >> 21) & 7` the range analyzer reported `resolved: true, unknown_reasons: []`. It now says the interval is bounded only by the mask and names the unresolved writers, such as "external function Upd" or "modified by `++`".
+6. **Value-origin functions were never opened.** They are excluded from the execution-path sequence, and the final LLM, the only thing that could request a re-explore, is disabled. I added one bounded deterministic re-explore that opens the unopened origin and unresolved functions when a verdict is `uncertain` (disable with `AOOB_MAX_REEXPLORE=0`).
+7. **`index_origin` read the callee name as a variable.** A call-expression index like `Mo_Inst_GetCoreIdx(checkword)` was labeled `"global"`. This is the untested `prep.py` change.
+8. **Smaller fixes.**
+   - A bad integer env var no longer crashes a run.
+   - The `uncertain` rationale now says when exploration coverage was partial.
+   - The prover prompts now define `no_credible_case` ("could not prove", not "a bug exists"). This addresses the FP_PROVE rationale that argued for a real bug.
+
+## Flaws found but not fixed
+
+- **Dead config knobs.** `AOOB_TP_POLICY` and `AOOB_OLLAMA_RUNTIME_FALLBACK` are documented and parsed but never used.
+- **Project-specific heuristics.** `"bswm"` and `"mrp"` are hard-coded in `explore_support.compact_explore_pack` and `validate._selector_matches_consumer`. They will misbehave on other codebases.
+- **Weak FP findings check.** `_finding_supported` accepts any real source line as an FP finding, so the "validated findings" requirement is weaker than it sounds.
+- **Final-LLM voting.** If you re-enable it, an FP wins on 50% of the votes (`counts["FP"]*2 >= len(votes)`), which conflicts with never-miss-TP. Its ironclad-FP branch is also unreachable, because an ironclad FP is forced earlier.
+- **Cost.** Each pure call-chain function (`sams_ALL_main`, `task_SAMS_bootup`, `Core0_main`) gets an LLM extraction. That is most of your 20 minutes and 80k tokens for an `uncertain` result.
+- **Report header.** It shows `Coverage full` (the prep cap) while the provers got `partial`, and it shows `Status: running` after completion. That code is in `run_pver_pipeline.py` / `pver_report_to_md.py`, which weren't in the zip.
+- **Run folder order.** `latest_run_dir` sorts names lexically, so `-10` sorts before `-2`.
+- **Not reviewed:** tool-agent mode, `pseudocode.py` internals, `guards.py`, and most of the 2,800-line `range_evidence.py`.
+
+## Order 39 itself
+
+Still undecided. The index is `(checkword >> 21) & 7` against a size-2 array, so it is a TP unless bits 21–23 of `checkword` are always 0 or 1. The two functions that decide that, `MoCEMM_Co_ChkwordFirstCoreTsk_MoCMem_st` and `MoCEMM_Co_UpdateChkwordCoreTsk`, were never read. With the fixes, a re-run should open them automatically. Without a re-run, I'd need their bodies to say more.
+
+
+
